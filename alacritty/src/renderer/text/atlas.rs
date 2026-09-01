@@ -9,7 +9,11 @@ use crate::gl::types::*;
 use super::Glyph;
 
 /// Size of the Atlas.
-pub const ATLAS_SIZE: i32 = 1024;
+///
+/// Increased from 1024 to 2048 to reduce atlas fragmentation and texture switches when
+/// rendering large glyphs like CJK ideographs. This stays well within the minimum guaranteed
+/// texture size of desktop OpenGL (2048) as well as the macOS limit (16384).
+pub const ATLAS_SIZE: i32 = 2048;
 
 /// Manages a single texture atlas.
 ///

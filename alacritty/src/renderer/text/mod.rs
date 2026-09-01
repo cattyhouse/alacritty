@@ -65,7 +65,15 @@ pub trait TextRenderer<'a> {
             for cell in cells {
                 api.draw_cell(cell, glyph_cache, size_info);
             }
-        })
+
+            // Reset the glyph cache once it has outgrown its limit. The batch is flushed
+            // explicitly before the reset, since clearing the atlas would otherwise invalidate
+            // glyphs which are still queued for rendering.
+            if glyph_cache.should_reset() {
+                api.render_batch();
+                glyph_cache.reset_glyph_cache(&mut api);
+            }
+        });
     }
 
     fn with_api<'b: 'a, F, T>(&'b mut self, size_info: &'b SizeInfo, func: F) -> T

@@ -14,6 +14,13 @@ use crate::gl::types::*;
 
 use super::builtin_font;
 
+/// Maximum number of glyphs to keep in the glyph cache before it is reset.
+///
+/// The cache is reset (clearing both the glyph map and the texture atlas) once this limit is
+/// reached. This prevents unbounded growth of rasterized glyphs and avoids continuously rising
+/// rasterization costs when viewing large amounts of unique characters, like long CJK text.
+const MAX_GLYPH_CACHE_SIZE: usize = 16_384;
+
 /// `LoadGlyph` allows for copying a rasterized glyph into graphics memory.
 pub trait LoadGlyph {
     /// Load the rasterized glyph into GPU memory.
@@ -76,6 +83,12 @@ pub struct GlyphCache {
 
     /// Whether to use the built-in font for box drawing characters.
     builtin_box_drawing: bool,
+
+    /// Maximum number of glyphs to keep in the cache before resetting it.
+    glyph_cache_limit: usize,
+
+    /// Whether the glyph cache should be reset at the end of the current frame.
+    needs_reset: bool,
 }
 
 impl GlyphCache {
@@ -95,6 +108,8 @@ impl GlyphCache {
             glyph_offset: font.glyph_offset,
             metrics,
             builtin_box_drawing: font.builtin_box_drawing,
+            glyph_cache_limit: MAX_GLYPH_CACHE_SIZE,
+            needs_reset: false,
         })
     }
 
@@ -206,6 +221,14 @@ impl GlyphCache {
             return *glyph;
         };
 
+        // Mark the cache for reset once it has grown past the limit, to prevent unbounded
+        // growth when rendering large amounts of unique glyphs (e.g. CJK text). The actual
+        // reset is deferred to the end of the frame, since resetting the atlas mid-frame would
+        // invalidate glyphs which have already been queued for rendering.
+        if self.cache.len() >= self.glyph_cache_limit {
+            self.needs_reset = true;
+        }
+
         // Rasterize the glyph using the built-in font for special characters or the user's font
         // for everything else.
         let rasterized = self
@@ -272,8 +295,14 @@ impl GlyphCache {
     pub fn reset_glyph_cache<L: LoadGlyph>(&mut self, loader: &mut L) {
         loader.clear();
         self.cache = Default::default();
+        self.needs_reset = false;
 
         self.load_common_glyphs(loader);
+    }
+
+    /// Check whether the glyph cache should be reset at the end of the current frame.
+    pub fn should_reset(&self) -> bool {
+        self.needs_reset
     }
 
     /// Update the inner font size.
@@ -300,6 +329,7 @@ impl GlyphCache {
         self.bold_italic_key = bold_italic;
         self.metrics = metrics;
         self.builtin_box_drawing = font.builtin_box_drawing;
+        self.needs_reset = false;
 
         Ok(())
     }
@@ -314,5 +344,97 @@ impl GlyphCache {
         self.load_glyphs_for_font(self.bold_key, loader);
         self.load_glyphs_for_font(self.italic_key, loader);
         self.load_glyphs_for_font(self.bold_italic_key, loader);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mock `LoadGlyph` which tracks clears and loads without touching GL.
+    #[derive(Default)]
+    struct MockLoader {
+        clears: usize,
+        loads: usize,
+    }
+
+    impl LoadGlyph for MockLoader {
+        fn load_glyph(&mut self, _rasterized: &RasterizedGlyph) -> Glyph {
+            self.loads += 1;
+            Glyph {
+                tex_id: 0,
+                multicolor: false,
+                top: 0,
+                left: 0,
+                width: 0,
+                height: 0,
+                uv_bot: 0.,
+                uv_left: 0.,
+                uv_width: 0.,
+                uv_height: 0.,
+            }
+        }
+
+        fn clear(&mut self) {
+            self.clears += 1;
+        }
+    }
+
+    fn dummy_glyph() -> Glyph {
+        MockLoader::default().load_glyph(&RasterizedGlyph::default())
+    }
+
+    #[test]
+    fn cache_marks_reset_when_limit_reached() {
+        let rasterizer = Rasterizer::new().expect("rasterizer");
+        let font = Font::default();
+        let mut cache = GlyphCache::new(rasterizer, &font).expect("glyph cache");
+
+        // Fill the cache past the limit with synthetic entries.
+        let mut key = GlyphKey {
+            font_key: cache.font_key,
+            size: cache.font_size,
+            character: '\u{1}',
+        };
+        for i in 0..MAX_GLYPH_CACHE_SIZE {
+            key.character = char::from_u32(0x100 + i as u32).unwrap();
+            cache.cache.insert(key, dummy_glyph());
+        }
+
+        assert!(!cache.should_reset());
+
+        // A cache miss past the limit should mark the cache for reset.
+        key.character = '界';
+        let _ = cache.get(key, &mut MockLoader::default(), true);
+        assert!(cache.should_reset());
+    }
+
+    #[test]
+    fn reset_clears_cache_and_reloads_common_glyphs() {
+        let rasterizer = Rasterizer::new().expect("rasterizer");
+        let font = Font::default();
+        let mut cache = GlyphCache::new(rasterizer, &font).expect("glyph cache");
+
+        // Simulate a grown cache with the reset flag set.
+        let mut key = GlyphKey {
+            font_key: cache.font_key,
+            size: cache.font_size,
+            character: '\u{1}',
+        };
+        for i in 0..MAX_GLYPH_CACHE_SIZE {
+            key.character = char::from_u32(0x100 + i as u32).unwrap();
+            cache.cache.insert(key, dummy_glyph());
+        }
+        cache.needs_reset = true;
+
+        let mut loader = MockLoader::default();
+        cache.reset_glyph_cache(&mut loader);
+
+        // Cache should be cleared and repopulated with common (ASCII) glyphs.
+        assert!(!cache.should_reset());
+        assert!(loader.clears >= 1);
+        assert!(cache.cache.len() >= 95);
+        // Common glyphs are loaded through the loader.
+        assert!(loader.loads >= 95);
     }
 }
