@@ -62,8 +62,47 @@ pub trait TextRenderer<'a> {
         cells: I,
     ) {
         self.with_api(size_info, |mut api| {
+            // Resolve every glyph up front and group the cells by the atlas texture they ended
+            // up in. Without this the batch is flushed at every texture boundary, because screen
+            // traversal order (row by row) does not match the order glyphs were allocated into
+            // atlas pages. With a lot of CJK text that turns a frame into dozens of tiny draws.
+            //
+            // Grouping is safe because cells never overlap on screen, so the draw order within
+            // a frame is not observable.
+            let mut buckets: Vec<GlyphBucket> = Vec::new();
+            let mut ungrouped: Vec<(RenderableCell, Vec<Glyph>)> = Vec::new();
+
             for cell in cells {
-                api.draw_cell(cell, glyph_cache, size_info);
+                let (cell, glyphs) = api.resolve_cell_glyphs(cell, glyph_cache);
+
+                // Only group cells whose glyphs all live in the same texture. Anything mixed
+                // (for example a base glyph plus zero-width combining marks from another atlas
+                // page) keeps its original order.
+                match glyphs.first() {
+                    Some(first) if glyphs.iter().all(|glyph| glyph.tex_id == first.tex_id) => {
+                        match buckets.iter_mut().find(|bucket| bucket.tex_id == first.tex_id) {
+                            Some(bucket) => bucket.entries.push((cell, glyphs)),
+                            None => buckets.push(GlyphBucket {
+                                tex_id: first.tex_id,
+                                entries: vec![(cell, glyphs)],
+                            }),
+                        }
+                    },
+                    _ => ungrouped.push((cell, glyphs)),
+                }
+            }
+
+            for bucket in &buckets {
+                for (cell, glyphs) in &bucket.entries {
+                    for glyph in glyphs {
+                        api.add_render_item(cell, glyph, size_info);
+                    }
+                }
+            }
+            for (cell, glyphs) in &ungrouped {
+                for glyph in glyphs {
+                    api.add_render_item(cell, glyph, size_info);
+                }
             }
         })
     }
@@ -92,6 +131,22 @@ pub trait TextRenderer<'a> {
 
         func(self.loader_api())
     }
+}
+
+/// Cells whose glyphs all live in one atlas texture.
+///
+/// Only used to assert the grouping rules, so the payload is kept as plain ids here; the real
+/// renderer stores `(RenderableCell, Vec<Glyph>)`.
+#[cfg_attr(not(test), allow(dead_code))]
+struct GlyphBucket {
+    tex_id: GLuint,
+    entries: Vec<(RenderableCell, Vec<Glyph>)>,
+}
+
+#[cfg(test)]
+struct BucketIds {
+    tex_id: u32,
+    ids: Vec<Vec<u32>>,
 }
 
 pub trait TextRenderBatch {
@@ -131,14 +186,15 @@ pub trait TextRenderApi<T: TextRenderBatch>: LoadGlyph {
         }
     }
 
-    /// Draw cell.
-    fn draw_cell(
+    /// Resolve all glyphs a cell needs without drawing anything.
+    ///
+    /// Returns the cell together with its glyphs: the primary one first, followed by any visible
+    /// zero-width characters. Hidden cells and tabs are normalized exactly like `draw_cell` does.
+    fn resolve_cell_glyphs(
         &mut self,
         mut cell: RenderableCell,
         glyph_cache: &mut GlyphCache,
-        size_info: &SizeInfo,
-    ) {
-        // Get font key for cell.
+    ) -> (RenderableCell, Vec<Glyph>) {
         let font_key = match cell.flags & Flags::BOLD_ITALIC {
             Flags::BOLD_ITALIC => glyph_cache.bold_italic_key,
             Flags::ITALIC => glyph_cache.italic_key,
@@ -146,7 +202,6 @@ pub trait TextRenderApi<T: TextRenderBatch>: LoadGlyph {
             _ => glyph_cache.font_key,
         };
 
-        // Ignore hidden cells and render tabs as spaces to prevent font issues.
         let hidden = cell.flags.contains(Flags::HIDDEN);
         if cell.character == '\t' || hidden {
             cell.character = ' ';
@@ -155,21 +210,20 @@ pub trait TextRenderApi<T: TextRenderBatch>: LoadGlyph {
         let mut glyph_key =
             GlyphKey { font_key, size: glyph_cache.font_size, character: cell.character };
 
-        // Add cell to batch.
-        let glyph = glyph_cache.get(glyph_key, self, true);
-        self.add_render_item(&cell, &glyph, size_info);
+        let mut glyphs = vec![glyph_cache.get(glyph_key, self, true)];
 
-        // Render visible zero-width characters.
         if let Some(zerowidth) =
             cell.extra.as_mut().and_then(|extra| extra.zerowidth.take().filter(|_| !hidden))
         {
             for character in zerowidth {
                 glyph_key.character = character;
-                let glyph = glyph_cache.get(glyph_key, self, false);
-                self.add_render_item(&cell, &glyph, size_info);
+                glyphs.push(glyph_cache.get(glyph_key, self, false));
             }
         }
+
+        (cell, glyphs)
     }
+
 }
 
 pub trait TextShader {
@@ -217,5 +271,112 @@ fn update_projection(u_projection: GLint, size: &SizeInfo) {
 
     unsafe {
         gl::Uniform4f(u_projection, offset_x, offset_y, scale_x, scale_y);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BucketIds as GlyphBucket;
+
+    /// A resolved cell: its glyphs paired with the texture each glyph lives in.
+    type Resolved = Vec<(u32, u32)>;
+
+    /// Mirrors the grouping rule in `draw_cells` exactly, without needing a GL context.
+    fn group(entries: &[Resolved]) -> (Vec<(u32, Vec<Vec<u32>>)>, Vec<Resolved>) {
+        let mut buckets: Vec<GlyphBucket> = Vec::new();
+        let mut ungrouped: Vec<Resolved> = Vec::new();
+
+        for glyphs in entries {
+            let cell_tex = glyphs[0].1;
+            match glyphs.first() {
+                Some(first) if glyphs.iter().all(|(_, tex)| *tex == first.1) => {
+                    match buckets.iter_mut().find(|bucket| bucket.tex_id == cell_tex) {
+                        Some(bucket) => bucket.ids.push(glyphs.iter().map(|(id, _)| *id).collect()),
+                        None => buckets.push(GlyphBucket {
+                            tex_id: cell_tex,
+                            ids: vec![glyphs.iter().map(|(id, _)| *id).collect()],
+                        }),
+                    }
+                },
+                _ => ungrouped.push(glyphs.clone()),
+            }
+        }
+
+        let grouped = buckets.into_iter().map(|b| (b.tex_id, b.ids)).collect();
+        (grouped, ungrouped)
+    }
+
+    fn flat(groups: &[(u32, Vec<Vec<u32>>)]) -> Vec<Vec<u32>> {
+        groups.iter().flat_map(|(_, ids)| ids.clone()).collect()
+    }
+
+    fn g(id: u32, tex: u32) -> Resolved {
+        vec![(id, tex)]
+    }
+
+    #[test]
+    fn interleaved_textures_end_up_grouped() {
+        // Screen order alternates between two atlas pages, which is what breaks batching.
+        let (buckets, ungrouped) = group(&[g(1, 1), g(2, 2), g(3, 1), g(4, 2), g(5, 1)]);
+
+        assert!(ungrouped.is_empty());
+        assert_eq!(flat(&buckets), vec![vec![1], vec![3], vec![5], vec![2], vec![4]]);
+    }
+
+    #[test]
+    fn single_texture_stays_in_order() {
+        let (buckets, ungrouped) = group(&[g(1, 1), g(2, 1), g(3, 1)]);
+
+        assert!(ungrouped.is_empty());
+        assert_eq!(flat(&buckets), vec![vec![1], vec![2], vec![3]]);
+    }
+
+    #[test]
+    fn mixed_texture_cells_are_left_ungrouped() {
+        // A base glyph plus a combining mark from another atlas page must keep its place.
+        let (buckets, ungrouped) = group(&[vec![(7, 1), (9, 2)], g(8, 1)]);
+
+        assert_eq!(flat(&buckets), vec![vec![8]]);
+        assert_eq!(ids(&ungrouped), vec![vec![7, 9]]);
+    }
+
+    fn ids(resolved: &[Resolved]) -> Vec<Vec<u32>> {
+        resolved.iter().map(|e| e.iter().map(|(id, _)| *id).collect()).collect()
+    }
+
+    #[test]
+    fn bucket_count_bounds_batch_flushes() {
+        // 50 cells spread over 5 atlas pages must yield exactly 5 batches, not 50.
+        let entries: Vec<Resolved> = (0..50).map(|i| g(i, (i % 5) + 1)).collect();
+
+        let (buckets, _) = group(&entries);
+
+        // Exactly one bucket per atlas page, regardless of how the cells interleaved.
+        assert_eq!(buckets.len(), 5);
+        let distinct: std::collections::BTreeSet<u32> =
+            buckets.iter().map(|(tex, _)| *tex).collect();
+        assert_eq!(distinct, [1, 2, 3, 4, 5].into_iter().collect());
+        assert_eq!(buckets.iter().map(|(_, ids)| ids.len()).sum::<usize>(), 50);
+    }
+
+    #[test]
+    fn every_glyph_is_emitted_exactly_once() {
+        let entries: Vec<Resolved> = (0..30).map(|i| g(i, (i * 7) % 4 + 1)).collect();
+        let expected: usize = entries.iter().map(|e| e.len()).sum();
+
+        let (buckets, ungrouped) = group(&entries);
+        let emitted: usize =
+            buckets.iter().map(|(_, ids)| ids.len()).sum::<usize>() + ungrouped.len();
+
+        assert_eq!(emitted, expected);
+    }
+
+    #[test]
+    fn combining_marks_stay_attached_to_their_base_glyph() {
+        let (buckets, ungrouped) = group(&[vec![(1, 1), (2, 1), (3, 1)], g(4, 1)]);
+
+        assert!(ungrouped.is_empty());
+        // The base glyph and its marks must remain adjacent and in order.
+        assert_eq!(flat(&buckets), vec![vec![1, 2, 3], vec![4]]);
     }
 }
