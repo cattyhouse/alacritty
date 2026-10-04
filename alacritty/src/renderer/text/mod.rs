@@ -69,40 +69,45 @@ pub trait TextRenderer<'a> {
             //
             // Grouping is safe because cells never overlap on screen, so the draw order within
             // a frame is not observable.
-            let mut buckets: Vec<GlyphBucket> = Vec::new();
-            let mut ungrouped: Vec<(RenderableCell, Vec<Glyph>)> = Vec::new();
+            let mut buckets: Vec<GlyphBucket> = Vec::with_capacity(8);
+            let mut ungrouped: Vec<ResolvedCell> = Vec::new();
 
             for cell in cells {
-                let (cell, glyphs) = api.resolve_cell_glyphs(cell, glyph_cache);
+                let resolved = api.resolve_cell(cell, glyph_cache);
 
                 // Only group cells whose glyphs all live in the same texture. Anything mixed
                 // (for example a base glyph plus zero-width combining marks from another atlas
                 // page) keeps its original order.
-                match glyphs.first() {
-                    Some(first) if glyphs.iter().all(|glyph| glyph.tex_id == first.tex_id) => {
-                        match buckets.iter_mut().find(|bucket| bucket.tex_id == first.tex_id) {
-                            Some(bucket) => bucket.entries.push((cell, glyphs)),
-                            None => buckets.push(GlyphBucket {
-                                tex_id: first.tex_id,
-                                entries: vec![(cell, glyphs)],
-                            }),
+                match resolved.single_texture() {
+                    Some(tex_id) => {
+                        match buckets.iter_mut().find(|bucket| bucket.tex_id == tex_id) {
+                            Some(bucket) => bucket.entries.push(resolved),
+                            None => {
+                                let mut bucket =
+                                    GlyphBucket { tex_id, entries: Vec::with_capacity(256) };
+                                bucket.entries.push(resolved);
+                                buckets.push(bucket);
+                            },
                         }
                     },
-                    _ => ungrouped.push((cell, glyphs)),
+                    None => ungrouped.push(resolved),
                 }
             }
 
+            let mut emit = |resolved: &ResolvedCell| {
+                api.add_render_item(&resolved.cell, &resolved.primary, size_info);
+                for glyph in &resolved.zerowidth {
+                    api.add_render_item(&resolved.cell, glyph, size_info);
+                }
+            };
+
             for bucket in &buckets {
-                for (cell, glyphs) in &bucket.entries {
-                    for glyph in glyphs {
-                        api.add_render_item(cell, glyph, size_info);
-                    }
+                for resolved in &bucket.entries {
+                    emit(resolved);
                 }
             }
-            for (cell, glyphs) in &ungrouped {
-                for glyph in glyphs {
-                    api.add_render_item(cell, glyph, size_info);
-                }
+            for resolved in &ungrouped {
+                emit(resolved);
             }
         })
     }
@@ -133,14 +138,33 @@ pub trait TextRenderer<'a> {
     }
 }
 
+/// A cell with every glyph it needs already resolved, ready to be grouped by texture.
+pub struct ResolvedCell {
+    cell: RenderableCell,
+    primary: Glyph,
+    /// Combining marks drawn on top of `primary`.
+    ///
+    /// Empty for almost every cell, and `Vec::new` does not allocate, so resolving a frame
+    /// costs no per-cell heap traffic on the common path.
+    zerowidth: Vec<Glyph>,
+}
+
+impl ResolvedCell {
+    /// The atlas texture this cell's glyphs all live in, or `None` when they are spread out.
+    pub fn single_texture(&self) -> Option<GLuint> {
+        if self.zerowidth.is_empty() || self.zerowidth.iter().all(|g| g.tex_id == self.primary.tex_id)
+        {
+            Some(self.primary.tex_id)
+        } else {
+            None
+        }
+    }
+}
+
 /// Cells whose glyphs all live in one atlas texture.
-///
-/// Only used to assert the grouping rules, so the payload is kept as plain ids here; the real
-/// renderer stores `(RenderableCell, Vec<Glyph>)`.
-#[cfg_attr(not(test), allow(dead_code))]
 struct GlyphBucket {
     tex_id: GLuint,
-    entries: Vec<(RenderableCell, Vec<Glyph>)>,
+    entries: Vec<ResolvedCell>,
 }
 
 #[cfg(test)]
@@ -189,12 +213,12 @@ pub trait TextRenderApi<T: TextRenderBatch>: LoadGlyph {
     /// Resolve all glyphs a cell needs without drawing anything.
     ///
     /// Returns the cell together with its glyphs: the primary one first, followed by any visible
-    /// zero-width characters. Hidden cells and tabs are normalized exactly like `draw_cell` does.
-    fn resolve_cell_glyphs(
+    /// zero-width characters.
+    fn resolve_cell(
         &mut self,
         mut cell: RenderableCell,
         glyph_cache: &mut GlyphCache,
-    ) -> (RenderableCell, Vec<Glyph>) {
+    ) -> ResolvedCell {
         let font_key = match cell.flags & Flags::BOLD_ITALIC {
             Flags::BOLD_ITALIC => glyph_cache.bold_italic_key,
             Flags::ITALIC => glyph_cache.italic_key,
@@ -210,18 +234,22 @@ pub trait TextRenderApi<T: TextRenderBatch>: LoadGlyph {
         let mut glyph_key =
             GlyphKey { font_key, size: glyph_cache.font_size, character: cell.character };
 
-        let mut glyphs = vec![glyph_cache.get(glyph_key, self, true)];
+        let primary = glyph_cache.get(glyph_key, self, true);
 
-        if let Some(zerowidth) =
+        // `Vec::new` does not allocate, and the overwhelming majority of cells have no
+        // combining marks, so the common path stays free of per-cell heap traffic.
+        let mut zerowidth = Vec::new();
+
+        if let Some(marks) =
             cell.extra.as_mut().and_then(|extra| extra.zerowidth.take().filter(|_| !hidden))
         {
-            for character in zerowidth {
+            for character in marks {
                 glyph_key.character = character;
-                glyphs.push(glyph_cache.get(glyph_key, self, false));
+                zerowidth.push(glyph_cache.get(glyph_key, self, false));
             }
         }
 
-        (cell, glyphs)
+        ResolvedCell { cell, primary, zerowidth }
     }
 
 }
