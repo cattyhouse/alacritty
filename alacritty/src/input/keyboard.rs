@@ -77,7 +77,8 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         // Mask `Alt` modifier from input when we won't send esc.
         let mods = if self.alt_send_esc(&key, text) { mods } else { mods & !ModifiersState::ALT };
 
-        let build_key_sequence = Self::should_build_sequence(&key, text, mode, mods);
+        let build_key_sequence =
+            should_build_sequence(&key.logical_key, key.location, text, mode, mods);
         let is_modifier_key = Self::is_modifier_key(&key);
 
         let bytes = if build_key_sequence {
@@ -138,37 +139,6 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                 | Key::Named(NamedKey::Alt)
                 | Key::Named(NamedKey::Super)
         )
-    }
-
-    /// Check whether we should try to build escape sequence for the [`KeyEvent`].
-    fn should_build_sequence(
-        key: &KeyEvent,
-        text: &str,
-        mode: TermMode,
-        mods: ModifiersState,
-    ) -> bool {
-        if mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC) {
-            return true;
-        }
-
-        let disambiguate = mode.contains(TermMode::DISAMBIGUATE_ESC_CODES)
-            && (key.logical_key == Key::Named(NamedKey::Escape)
-                || key.location == KeyLocation::Numpad
-                || (!mods.is_empty()
-                    && (mods != ModifiersState::SHIFT
-                        || matches!(
-                            key.logical_key,
-                            Key::Named(NamedKey::Tab)
-                                | Key::Named(NamedKey::Enter)
-                                | Key::Named(NamedKey::Backspace)
-                        ))));
-
-        match key.logical_key {
-            _ if disambiguate => true,
-            // Exclude all the named keys unless they have textual representation.
-            Key::Named(named) => named.to_text().is_none(),
-            _ => text.is_empty(),
-        }
     }
 
     /// Attempt to find a binding and execute its action.
@@ -288,6 +258,74 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     }
 }
 
+/// Lowercase codepoint for Ctrl+Shift+ASCII-letter, which has no legacy encoding
+/// (Shift is silently lost, e.g. Ctrl+Shift+F arrives downstream as bare 0x06 like
+/// Ctrl+F). Callers encode it Kitty-style even when no keyboard protocol was
+/// negotiated. This mirrors what Ghostty sends unprompted and lets tmux forward the
+/// Shift bit (mods 6) instead of dropping it.
+fn ctrl_shift_letter_codepoint<S: AsRef<str>>(
+    logical: &Key<S>,
+    ctrl: bool,
+    shift: bool,
+) -> Option<u32> {
+    if !ctrl || !shift {
+        return None;
+    }
+
+    match logical {
+        Key::Character(ch) => {
+            let text = ch.as_ref();
+            if text.chars().count() == 1
+                && matches!(text.chars().next(), Some(c) if c.is_ascii_alphabetic())
+            {
+                text.chars().next().map(|c| u32::from(c.to_ascii_lowercase()))
+            } else {
+                None
+            }
+        },
+        _ => None,
+    }
+}
+
+/// Check whether we should try to build escape sequence for the key press.
+fn should_build_sequence(
+    logical: &Key,
+    location: KeyLocation,
+    text: &str,
+    mode: TermMode,
+    mods: ModifiersState,
+) -> bool {
+    if mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC) {
+        return true;
+    }
+
+    let disambiguate = mode.contains(TermMode::DISAMBIGUATE_ESC_CODES)
+        && (logical == &Key::Named(NamedKey::Escape)
+            || location == KeyLocation::Numpad
+            || (!mods.is_empty()
+                && (mods != ModifiersState::SHIFT
+                    || matches!(
+                        logical,
+                        Key::Named(NamedKey::Tab)
+                            | Key::Named(NamedKey::Enter)
+                            | Key::Named(NamedKey::Backspace)
+                    ))));
+
+    match logical {
+        _ if disambiguate => true,
+        // Legacy cannot carry Shift together with Ctrl on letters; encode it so the
+        // Shift bit survives hosts that never negotiate a protocol (e.g. tmux).
+        _ if ctrl_shift_letter_codepoint(logical, mods.control_key(), mods.shift_key())
+            .is_some() =>
+        {
+            true
+        },
+        // Exclude all the named keys unless they have textual representation.
+        Key::Named(named) => named.to_text().is_none(),
+        _ => text.is_empty(),
+    }
+}
+
 /// Build a key's keyboard escape sequence based on the given `key`, `mods`, and `mode`.
 ///
 /// The key sequences for `APP_KEYPAD` and alike are handled inside the bindings.
@@ -380,6 +418,18 @@ impl SequenceBuilder {
         key: &KeyEvent,
         associated_text: Option<&str>,
     ) -> Option<SequenceBase> {
+        // Legacy Ctrl+Shift+letter fallback: encode Kitty-style without alternate keys,
+        // since none were negotiated. In legacy mode (`!kitty_seq`) every other
+        // Character key keeps falling through to `None` below, as before.
+        if !self.kitty_seq && !self.kitty_encode_all {
+            return ctrl_shift_letter_codepoint(
+                &key.logical_key.as_ref(),
+                self.modifiers.contains(SequenceModifiers::CONTROL),
+                self.modifiers.contains(SequenceModifiers::SHIFT),
+            )
+            .map(|code| SequenceBase::new(code.to_string().into(), SequenceTerminator::Kitty));
+        }
+
         let character = match key.logical_key.as_ref() {
             Key::Character(character) if self.kitty_seq => character,
             _ => return None,
@@ -715,4 +765,68 @@ fn is_control_character(text: &str) -> bool {
     // does not match the reported text (`^H`), despite not technically being part of C0 or C1.
     let codepoint = text.bytes().next().unwrap();
     text.len() == 1 && (codepoint < 0x20 || (0x7f..=0x9f).contains(&codepoint))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winit::keyboard::SmolStr;
+
+    #[test]
+    fn ctrl_shift_letter_resolves_lowercase_codepoint() {
+        assert_eq!(
+            ctrl_shift_letter_codepoint(&Key::<SmolStr>::Character(SmolStr::from("F")), true, true),
+            Some(102)
+        );
+        // Shift alone (typing capitals) and Ctrl alone keep legacy behavior.
+        assert_eq!(
+            ctrl_shift_letter_codepoint(&Key::<SmolStr>::Character(SmolStr::from("F")), false, true),
+            None
+        );
+        assert_eq!(
+            ctrl_shift_letter_codepoint(&Key::<SmolStr>::Character(SmolStr::from("f")), true, false),
+            None
+        );
+        // Non-letters are untouched.
+        assert_eq!(
+            ctrl_shift_letter_codepoint(&Key::<SmolStr>::Named(NamedKey::Enter), true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_letter_disambiguated_without_protocol() {
+        let mods = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(should_build_sequence(
+            &Key::<SmolStr>::Character(SmolStr::from("F")),
+            KeyLocation::Standard,
+            "\x06",
+            TermMode::empty(),
+            mods,
+        ));
+    }
+
+    #[test]
+    fn shift_only_letter_stays_legacy() {
+        // Shift+F without Ctrl types capital F; must not become an escape sequence.
+        assert!(!should_build_sequence(
+            &Key::<SmolStr>::Character(SmolStr::from("F")),
+            KeyLocation::Standard,
+            "F",
+            TermMode::empty(),
+            ModifiersState::SHIFT,
+        ));
+    }
+
+    #[test]
+    fn ctrl_only_letter_stays_legacy() {
+        // Bare Ctrl+F keeps its well-defined 0x06 (tmux maps it to CSI 102;5u itself).
+        assert!(!should_build_sequence(
+            &Key::<SmolStr>::Character(SmolStr::from("f")),
+            KeyLocation::Standard,
+            "\x06",
+            TermMode::empty(),
+            ModifiersState::CONTROL,
+        ));
+    }
 }

@@ -22,8 +22,8 @@ use crate::term::color::Colors;
 use crate::vi_mode::{ViModeCursor, ViMotion};
 use crate::vte::ansi::{
     self, Attr, CharsetIndex, Color, CursorShape, CursorStyle, Handler, Hyperlink, KeyboardModes,
-    KeyboardModesApplyBehavior, NamedColor, NamedMode, NamedPrivateMode, PrivateMode, Rgb,
-    StandardCharset,
+    KeyboardModesApplyBehavior, ModifyOtherKeys, NamedColor, NamedMode, NamedPrivateMode,
+    PrivateMode, Rgb, StandardCharset,
 };
 
 pub mod cell;
@@ -322,6 +322,11 @@ pub struct Term<T> {
     /// Currently inactive keyboard mode stack.
     inactive_keyboard_mode_stack: Vec<KeyboardModes>,
 
+    /// XTMODKEYS (modifyOtherKeys) request from the outer host (e.g. tmux asking on
+    /// behalf of the inner app with `CSI > 4;2 m`). Honored via Kitty DISAMBIGUATE so
+    /// Ctrl+Shift+letter stays distinguishable through tmux's CSI-u forwarding.
+    modify_other_keys: bool,
+
     /// Information about damaged cells.
     damage: TermDamageState,
 
@@ -432,6 +437,7 @@ impl<T> Term<T> {
             tabs,
             inactive_keyboard_mode_stack: Default::default(),
             keyboard_mode_stack: Default::default(),
+            modify_other_keys: Default::default(),
             active_charset: Default::default(),
             vi_mode_cursor: Default::default(),
             cursor_style: Default::default(),
@@ -518,6 +524,7 @@ impl<T> Term<T> {
         if self.config.kitty_keyboard != old_config.kitty_keyboard {
             self.keyboard_mode_stack = Vec::new();
             self.inactive_keyboard_mode_stack = Vec::new();
+            self.modify_other_keys = false;
             self.mode.remove(TermMode::KITTY_KEYBOARD_PROTOCOL);
         }
 
@@ -1029,11 +1036,15 @@ impl<T> Term<T> {
     fn set_keyboard_mode(&mut self, mode: TermMode, apply: KeyboardModesApplyBehavior) {
         let active_mode = self.mode & TermMode::KITTY_KEYBOARD_PROTOCOL;
         self.mode &= !TermMode::KITTY_KEYBOARD_PROTOCOL;
-        let new_mode = match apply {
+        let mut new_mode = match apply {
             KeyboardModesApplyBehavior::Replace => mode,
             KeyboardModesApplyBehavior::Union => active_mode.union(mode),
             KeyboardModesApplyBehavior::Difference => active_mode.difference(mode),
         };
+        // Preserve an outer XTMODKEYS request across Kitty stack operations.
+        if self.modify_other_keys {
+            new_mode.insert(TermMode::DISAMBIGUATE_ESC_CODES);
+        }
         trace!("Setting keyboard mode to {new_mode:?}");
         self.mode |= new_mode;
     }
@@ -1326,6 +1337,44 @@ impl<T: EventListener> Handler for Term<T> {
         }
 
         self.set_keyboard_mode(mode.into(), apply);
+    }
+
+    #[inline]
+    fn set_modify_other_keys(&mut self, mode: ModifyOtherKeys) {
+        if !self.config.kitty_keyboard {
+            return;
+        }
+
+        // Both Enable modes are honored as full disambiguation: tmux uses EnableAll,
+        // and the Kitty encoder is what keeps Ctrl+Shift distinguishable through
+        // tmux's CSI-u forwarding. Mode 1 (except well-defined) is treated the same
+        // to keep the fork minimal.
+        self.modify_other_keys = mode != ModifyOtherKeys::Reset;
+        if self.modify_other_keys {
+            self.mode.insert(TermMode::DISAMBIGUATE_ESC_CODES);
+        } else {
+            // Don't clobber a Kitty push that also wants disambiguation.
+            let stack_wants: TermMode = self
+                .keyboard_mode_stack
+                .last()
+                .copied()
+                .unwrap_or(KeyboardModes::NO_MODE)
+                .into();
+            if !stack_wants.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
+                self.mode.remove(TermMode::DISAMBIGUATE_ESC_CODES);
+            }
+        }
+    }
+
+    #[inline]
+    fn report_modify_other_keys(&mut self) {
+        if !self.config.kitty_keyboard {
+            return;
+        }
+
+        let mode = if self.modify_other_keys { 2 } else { 0 };
+        let text = format!("\x1b[>4;{mode}m");
+        self.event_proxy.send_event(Event::PtyWrite(text));
     }
 
     #[inline]
@@ -1848,6 +1897,7 @@ impl<T: EventListener> Handler for Term<T> {
         self.vi_mode_cursor = Default::default();
         self.keyboard_mode_stack = Default::default();
         self.inactive_keyboard_mode_stack = Default::default();
+        self.modify_other_keys = false;
 
         // Preserve vi mode across resets.
         self.mode &= TermMode::VI;
@@ -3289,6 +3339,31 @@ mod tests {
         term.title = Some("Test".into());
         term.set_title(None);
         assert_eq!(term.title, None);
+    }
+
+    #[test]
+    fn xtmodkeys_shim_enables_disambiguate() {
+        let size = TermSize::new(5, 10);
+        let mut config = Config::default();
+        config.kitty_keyboard = true;
+        let mut term = Term::new(config, &size, VoidListener);
+
+        assert!(!term.mode.contains(TermMode::DISAMBIGUATE_ESC_CODES));
+
+        // tmux requests XTMODKEYS EnableAll (`CSI > 4;2 m`); Alacritty must leave
+        // legacy mode so Ctrl+Shift+letter stays distinguishable.
+        term.set_modify_other_keys(ansi::ModifyOtherKeys::EnableAll);
+        assert!(term.mode.contains(TermMode::DISAMBIGUATE_ESC_CODES));
+
+        // A Kitty push without DISAMBIGUATE must not clear the XTMODKEYS request...
+        term.push_keyboard_mode(ansi::KeyboardModes::REPORT_EVENT_TYPES);
+        assert!(term.mode.contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        term.pop_keyboard_modes(1);
+        assert!(term.mode.contains(TermMode::DISAMBIGUATE_ESC_CODES));
+
+        // ...and reset must return to legacy.
+        term.set_modify_other_keys(ansi::ModifyOtherKeys::Reset);
+        assert!(!term.mode.contains(TermMode::DISAMBIGUATE_ESC_CODES));
     }
 
     #[test]
