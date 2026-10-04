@@ -949,8 +949,8 @@ impl Display {
         };
 
         // Handle IME.
-        if self.ime.is_enabled() {
-            if let Some(point) = ime_position {
+        if let Some(point) = ime_position {
+            if self.ime.is_enabled() {
                 let (fg, bg) = if search_state.regex().is_some() {
                     (config.colors.footer_bar_foreground(), config.colors.footer_bar_background())
                 } else {
@@ -958,6 +958,16 @@ impl Display {
                 };
 
                 self.draw_ime_preview(point, fg, bg, &mut rects, config);
+            } else {
+                // Keep the input method's idea of the cursor current even while no IME is
+                // active.
+                //
+                // The IME asks for this position the moment it starts composing, which happens
+                // as soon as it becomes active again. On macOS the activation event only
+                // arrives once the user actually types, so if the cursor moved while the IME
+                // was inactive, waiting for the next frame would leave the candidate window at
+                // the spot the cursor used to occupy.
+                self.window.update_ime_position(point, &self.size_info);
             }
         }
 

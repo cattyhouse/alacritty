@@ -1,6 +1,6 @@
 # Alacritty (cattyhouse fork)
 
-基于上游 [alacritty/alacritty](https://github.com/alacritty/alacritty)，针对 **macOS / Apple Silicon** 修两个具体问题。
+基于上游 [alacritty/alacritty](https://github.com/alacritty/alacritty)，针对 **macOS / Apple Silicon** 修三个具体问题。
 
 上游文档（安装、配置项、功能列表）见 `INSTALL.md` 与 [docs/features.md](docs/features.md)；本文只写这个 fork 相对上游多出来的东西。
 
@@ -105,12 +105,54 @@ bindings = [
 
 ---
 
+## 修复三：输入法候选窗不跟随光标
+
+### 症状
+
+从别的 app 切回 alacritty 后，输入法候选窗不跟着光标走。
+
+复现：
+
+1. 打开两个 tmux pane，光标停在 pane A
+2. `cmd+tab` 切走再切回
+3. 点 pane B 打字
+
+拼音字母出现在 pane B（终端光标确实移过去了），候选窗却弹在 pane A 的位置。**只在切回后第一次出现**，选完一个词之后再打字就正常了。
+
+### 原因
+
+alacritty 把光标位置交给系统用于摆放候选窗，这条路径只在绘制过程中被调用，且被 `ime.is_enabled()` 挡着 —— **IME 没启用时一次位置都不更新**。
+
+而 macOS 上 winit 的 `Ime::Enabled` 只在输入法真正开始打字时才发，不随窗口重新获得焦点而发。于是切走后位置被冻结在旧处，切回后一打字，IME 立刻用那个旧坐标摆窗；1 毫秒后 alacritty 才推送正确位置，但窗已经摆完了。
+
+埋点时间戳（MacBook M1 / macOS 27.2）：
+
+```
+T=…690.802  推送 grid=(2,2)      ← 焦点在 pane A
+T=…691.543  Ime::Disabled        ← 切走
+   ……5.6 秒，一次位置都没推过……
+T=…697.185  Ime::Enabled
+T=…697.185  preedit="n" …        ← 同毫秒，按旧坐标(列 2)摆窗
+T=…697.186  推送 grid=(2,69)     ← 正确位置，晚了一步
+```
+
+### 做法
+
+IME 停用期间也持续推送位置（`display/mod.rs`，12 行）。这样 IME 一旦启用，读到的永远是最近一帧的坐标。
+
+代价是每帧多一次 `invalidateCharacterCoordinates()`，很轻。
+
+详见 [`PLAN-ime-cursor-position.md`](PLAN-ime-cursor-position.md)。
+
+---
+
 ## 仓库内容
 
 | 路径 | 说明 |
 |---|---|
 | `PLAN-bucket-sort.md` | 中文渲染方案：设计、验收标准、实测数据、复现步骤 |
 | `PLAN-xtmodkeys-shim.md` | Ctrl+Shift+字母方案 |
+| `PLAN-ime-cursor-position.md` | 输入法候选窗位置方案：根因、实测时间线、未验证项 |
 | `docs/cjk.fix.discuss.md` | 方案演进与评审记录（含一个被否决的动态扩容方案，勿照此实现） |
 | `testdata/cjk_bucket.txt` | 渲染卡顿复现语料：240 行 × 140 字，3199 个不重复汉字 |
 | `FORK.md` | 分支与远端工作流 |
