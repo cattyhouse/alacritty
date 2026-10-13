@@ -78,10 +78,11 @@
 5. 构建 release + 打包安装到 `/Applications/Alacritty.app`。
    Done = `--version` 报告新的本地 commit。
    Could fail at: 编译失败、替换时 Alacritty 正在运行。
-   Status: DONE `[measured]` — `cargo build --release` rc=0、`make app` rc=0，
+   Status: DONE `[measured]` — `cargo build --release` rc=0、`make app` rc=0；
    安装后 `/Applications/Alacritty.app/Contents/MacOS/alacritty --version`
-   → `alacritty 0.18.0-dev (f0f81a69)`，二进制 sha256 由
-   `2e4b3eee…582fb` 变为 `b6679d33…1cb44`（确认真的替换了），adhoc 签名正常。
+   报告的 commit 与 `git rev-parse --short HEAD` 一致（每次都在提交后重建，
+   否则 build.rs 缓存的旧版本号会让新旧二进制无法区分）；二进制 sha256 由
+   `2e4b3eee…582fb` 变为新值，确认真的替换了；adhoc 签名正常。
 
 ## 说明：为什么 #6880 不能做到"全自动"
 
