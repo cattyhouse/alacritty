@@ -402,6 +402,10 @@ impl<T: EventListener> Execute<T> for Action {
                 ctx.mark_dirty();
             },
             Action::ClearHistory => ctx.terminal_mut().clear_screen(ClearMode::Saved),
+            Action::ResetState => {
+                ctx.terminal_mut().soft_reset();
+                ctx.mark_dirty();
+            },
             Action::ClearLogNotice => ctx.pop_message(),
             #[cfg(not(target_os = "macos"))]
             Action::CreateNewWindow => ctx.create_new_window(),
@@ -971,6 +975,19 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     pub fn reset_mouse_cursor(&mut self) {
         let mouse_state = self.cursor_state();
         self.ctx.window().set_mouse_cursor(mouse_state);
+    }
+
+    /// Force the mouse cursor to be resolved again, even when it is unchanged.
+    ///
+    /// Used when the window regains focus, since the windowing system keeps the
+    /// cursor shape that was active while the window was inactive.
+    #[inline]
+    pub fn refresh_mouse_cursor(&mut self) {
+        let mouse_state = self.cursor_state();
+        self.ctx.window().refresh_mouse_cursor(mouse_state);
+
+        // Prompt hint highlight update.
+        self.ctx.mouse_mut().hint_highlight_dirty = true;
     }
 
     /// Modifier state change.

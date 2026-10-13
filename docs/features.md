@@ -79,6 +79,29 @@ file. If an application captures your mouse clicks, which is indicated by a
 change in mouse cursor shape, you're required to hold <kbd>Shift</kbd> to bypass
 that.
 
+## Recovery from a broken terminal state
+
+Programs which enable mouse reporting or switch to the alternate screen are
+supposed to restore the terminal before exiting. When they cannot, for example
+when an SSH connection drops while `tmux` has mouse reporting enabled, the
+terminal is left in that state: clicks are reported as escape sequences instead
+of selecting text, and the wheel scrolls the application instead of the
+scrollback.
+
+Alacritty cannot detect this by itself, since the process which set up the state
+is not the process it has started. Binding `ResetState` to a key gives you a
+single keystroke which resets all terminal modes and leaves the alternate screen
+while keeping the window content and the scrollback intact:
+
+```toml
+[[keyboard.bindings]]
+key = "R"
+mods = "Alt"
+action = "ResetState"
+```
+
+Unlike `echo -ne '\ec'` (RIS), nothing that was printed before is lost.
+
 ## Multi-Window
 
 Alacritty supports running multiple terminal emulators from the same Alacritty

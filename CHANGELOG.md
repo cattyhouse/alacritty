@@ -21,6 +21,15 @@ Notable changes to the `alacritty_terminal` crate are documented in its
 - Lacking permissions to launch software sending Apple events
 - Off-by-one in vi mode ParagraphUp action
 - Unbounded per-cell memory usage for zero-width cells
+- Mouse shape sticking to the hyperlink hand after clicking a link which moved the
+    focus to another application
+- Mouse tracking modes 1000/1002/1003 no longer disable each other, so a program
+    requesting several of them keeps all of them
+
+### Added
+
+- `ResetState` key binding action, which resets the terminal modes and leaves the
+    alternate screen without clearing the display buffer or the scrollback
 
 ## 0.17.0
 

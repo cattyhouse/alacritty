@@ -1050,6 +1050,41 @@ impl<T> Term<T> {
     }
 }
 
+impl<T: EventListener> Term<T> {
+    /// Reset the terminal to its initial state, without destroying its content.
+    ///
+    /// This is the recovery path for applications which exited without restoring
+    /// the terminal state they had set up, like an SSH session dropping while a
+    /// fullscreen program had requested mouse reporting and the alternate screen.
+    ///
+    /// Unlike `ESC c` (RIS), the visible content and the scrollback are kept, so
+    /// nothing that was printed before the program died is lost.
+    pub fn soft_reset(&mut self) {
+        // Leave the alternate screen without wiping the primary screen.
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            mem::swap(&mut self.grid, &mut self.inactive_grid);
+        }
+
+        // Preserve vi mode across the reset.
+        self.mode &= TermMode::VI;
+        self.mode.insert(TermMode::default());
+
+        self.active_charset = Default::default();
+        self.cursor_style = None;
+        self.scroll_region = Line(0)..Line(self.screen_lines() as i32);
+        self.tabs = TabStops::new(self.columns());
+        self.selection = None;
+        self.vi_mode_cursor = Default::default();
+        self.keyboard_mode_stack = Default::default();
+        self.inactive_keyboard_mode_stack = Default::default();
+        self.modify_other_keys = false;
+
+        self.event_proxy.send_event(Event::MouseCursorDirty);
+        self.event_proxy.send_event(Event::CursorBlinkingChange);
+        self.mark_fully_damaged();
+    }
+}
+
 impl<T> Dimensions for Term<T> {
     #[inline]
     fn columns(&self) -> usize {
@@ -2000,19 +2035,17 @@ impl<T: EventListener> Handler for Term<T> {
             },
             NamedPrivateMode::ShowCursor => self.mode.insert(TermMode::SHOW_CURSOR),
             NamedPrivateMode::CursorKeys => self.mode.insert(TermMode::APP_CURSOR),
-            // Mouse protocols are mutually exclusive.
+            // Mouse tracking modes are cumulative: 1002 extends 1000, and 1003
+            // extends 1002, so each one only ever adds its own reporting mode.
             NamedPrivateMode::ReportMouseClicks => {
-                self.mode.remove(TermMode::MOUSE_MODE);
                 self.mode.insert(TermMode::MOUSE_REPORT_CLICK);
                 self.event_proxy.send_event(Event::MouseCursorDirty);
             },
             NamedPrivateMode::ReportCellMouseMotion => {
-                self.mode.remove(TermMode::MOUSE_MODE);
                 self.mode.insert(TermMode::MOUSE_DRAG);
                 self.event_proxy.send_event(Event::MouseCursorDirty);
             },
             NamedPrivateMode::ReportAllMouseMotion => {
-                self.mode.remove(TermMode::MOUSE_MODE);
                 self.mode.insert(TermMode::MOUSE_MOTION);
                 self.event_proxy.send_event(Event::MouseCursorDirty);
             },
@@ -3364,6 +3397,76 @@ mod tests {
         // ...and reset must return to legacy.
         term.set_modify_other_keys(ansi::ModifyOtherKeys::Reset);
         assert!(!term.mode.contains(TermMode::DISAMBIGUATE_ESC_CODES));
+    }
+
+    #[test]
+    fn mouse_tracking_modes_are_cumulative() {
+        let size = TermSize::new(10, 5);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser = ansi::Processor::<ansi::StdSyncHandler>::new();
+
+        // What `tmux` with `set -g mouse on` emits.
+        parser.advance(&mut term, b"\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+        assert!(term.mode.contains(TermMode::MOUSE_REPORT_CLICK));
+        assert!(term.mode.contains(TermMode::MOUSE_DRAG));
+        assert!(term.mode.contains(TermMode::SGR_MOUSE));
+
+        // 1003 extends 1002, so it must not drop the narrower modes.
+        parser.advance(&mut term, b"\x1b[?1003h");
+        assert!(term.mode.contains(TermMode::MOUSE_REPORT_CLICK));
+        assert!(term.mode.contains(TermMode::MOUSE_DRAG));
+        assert!(term.mode.contains(TermMode::MOUSE_MOTION));
+
+        // Each mode is unset on its own, without touching the others.
+        parser.advance(&mut term, b"\x1b[?1002l");
+        assert!(term.mode.contains(TermMode::MOUSE_REPORT_CLICK));
+        assert!(!term.mode.contains(TermMode::MOUSE_DRAG));
+        assert!(term.mode.contains(TermMode::MOUSE_MOTION));
+
+        parser.advance(&mut term, b"\x1b[?1003l");
+        assert!(term.mode.contains(TermMode::MOUSE_REPORT_CLICK));
+        assert!(!term.mode.contains(TermMode::MOUSE_MOTION));
+
+        parser.advance(&mut term, b"\x1b[?1000l");
+        assert!(!term.mode.intersects(TermMode::MOUSE_MODE));
+
+        // The mouse encoding is independent of the tracking modes.
+        assert!(term.mode.contains(TermMode::SGR_MOUSE));
+        parser.advance(&mut term, b"\x1b[?1006l");
+        assert!(!term.mode.contains(TermMode::SGR_MOUSE));
+    }
+
+    #[test]
+    fn soft_reset_restores_modes_and_keeps_history() {
+        let size = TermSize::new(5, 10);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser = ansi::Processor::<ansi::StdSyncHandler>::new();
+
+        // Fill the history before switching to the alternate screen.
+        parser.advance(&mut term, b"line one\r\nline two\r\n");
+        let scrollback = term.grid().history_size();
+
+        // Leave the terminal in the state a killed `tmux` client leaves behind.
+        parser
+            .advance(&mut term, b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[4h");
+        assert!(term.mode.contains(TermMode::ALT_SCREEN));
+        assert!(term.mode.intersects(TermMode::MOUSE_MODE));
+        assert!(term.mode.contains(TermMode::BRACKETED_PASTE));
+        assert!(term.mode.contains(TermMode::INSERT));
+
+        term.soft_reset();
+
+        assert!(!term.mode.contains(TermMode::ALT_SCREEN));
+        assert!(!term.mode.intersects(TermMode::MOUSE_MODE));
+        assert!(!term.mode.contains(TermMode::SGR_MOUSE));
+        assert!(!term.mode.contains(TermMode::BRACKETED_PASTE));
+        assert!(!term.mode.contains(TermMode::INSERT));
+
+        // Unlike `ESC c`, the content and the scrollback survive the soft reset.
+        assert_eq!(term.grid().history_size(), scrollback);
+        let visible = term.grid().display_iter().map(|c| c.c).collect::<String>();
+        assert!(visible.contains("line one"), "visible content was wiped: {visible:?}");
+        assert!(visible.contains("line two"), "visible content was wiped: {visible:?}");
     }
 
     #[test]

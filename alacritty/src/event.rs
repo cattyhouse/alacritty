@@ -1985,6 +1985,16 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     WindowEvent::Focused(is_focused) => {
                         self.ctx.terminal.is_focused = is_focused;
 
+                        // Mouse releases are swallowed when another application steals
+                        // the focus mid-click, so the buttons would stay pressed.
+                        if !is_focused {
+                            let mouse = &mut self.ctx.mouse;
+                            mouse.left_button_state = ElementState::Released;
+                            mouse.middle_button_state = ElementState::Released;
+                            mouse.right_button_state = ElementState::Released;
+                            mouse.block_hint_launcher = false;
+                        }
+
                         // When the unfocused hollow is used we must redraw on focus change.
                         if self.ctx.config.cursor.unfocused_hollow {
                             *self.ctx.dirty = true;
@@ -2000,6 +2010,12 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
 
                         // Ensure IME is disabled while unfocused.
                         self.ctx.window().set_ime_inhibitor(ImeInhibitor::FOCUS, !is_focused);
+
+                        // Re-apply the cursor shape, since the one which was active
+                        // before the focus change would otherwise stick around.
+                        if is_focused {
+                            self.refresh_mouse_cursor();
+                        }
                     },
                     WindowEvent::Occluded(occluded) => {
                         *self.ctx.occluded = occluded;
@@ -2014,6 +2030,11 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         if self.ctx.display().highlighted_hint.is_some() {
                             *self.ctx.dirty = true;
                         }
+                    },
+                    WindowEvent::CursorEntered { .. } => {
+                        // The cursor shape is only resolved again while the mouse moves,
+                        // which does not happen while the window is inactive.
+                        self.refresh_mouse_cursor();
                     },
                     WindowEvent::Ime(ime) => match ime {
                         Ime::Commit(text) => {
@@ -2046,7 +2067,6 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     | WindowEvent::DoubleTapGesture { .. }
                     | WindowEvent::TouchpadPressure { .. }
                     | WindowEvent::RotationGesture { .. }
-                    | WindowEvent::CursorEntered { .. }
                     | WindowEvent::PinchGesture { .. }
                     | WindowEvent::AxisMotion { .. }
                     | WindowEvent::PanGesture { .. }

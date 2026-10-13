@@ -272,6 +272,38 @@ impl Window {
         }
     }
 
+    /// Re-apply the mouse cursor, bypassing the cursor shape cache.
+    ///
+    /// Both the windowing system and this wrapper only update the cursor when the
+    /// requested shape differs from the last one applied. The system additionally
+    /// only re-resolves the shape while the mouse moves, and mouse movement is not
+    /// delivered while the window is inactive. A shape which was active when
+    /// another application was launched, like the hand shown over a clicked
+    /// hyperlink, would therefore survive the return to this window.
+    pub fn refresh_mouse_cursor(&mut self, cursor: CursorIcon) {
+        self.current_mouse_cursor = cursor;
+        self.window.set_cursor(cursor);
+
+        // Since the shape is unchanged, ask the system to resolve the shape which
+        // is valid at the current mouse position again.
+        #[cfg(target_os = "macos")]
+        self.invalidate_cursor_rects();
+    }
+
+    /// Make the system resolve the cursor shape below the mouse again.
+    #[cfg(target_os = "macos")]
+    fn invalidate_cursor_rects(&self) {
+        let view = match self.raw_window_handle() {
+            RawWindowHandle::AppKit(handle) => {
+                assert!(MainThreadMarker::new().is_some());
+                unsafe { handle.ns_view.cast::<NSView>().as_ref() }
+            },
+            _ => return,
+        };
+
+        view.window().unwrap().invalidateCursorRectsForView(view);
+    }
+
     /// Set mouse cursor visible.
     pub fn set_mouse_visible(&mut self, visible: bool) {
         if visible != self.mouse_visible {

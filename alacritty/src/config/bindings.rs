@@ -163,6 +163,9 @@ pub enum Action {
     /// Clear the display buffer(s) to remove history.
     ClearHistory,
 
+    /// Reset the terminal modes without clearing the display buffer.
+    ResetState,
+
     /// Hide the Alacritty window.
     Hide,
 
@@ -1250,6 +1253,8 @@ mod tests {
 
     use winit::keyboard::ModifiersState;
 
+    use crate::config::ui_config::UiConfig;
+
     type MockBinding = Binding<usize>;
 
     impl Default for MockBinding {
@@ -1448,5 +1453,20 @@ mod tests {
         assert!(binding.is_triggered_by(BindingMode::VI, mods, &t));
         assert!(!binding.is_triggered_by(BindingMode::ALT_SCREEN, mods, &t));
         assert!(!binding.is_triggered_by(BindingMode::ALT_SCREEN | BindingMode::VI, mods, &t));
+    }
+
+    #[test]
+    fn reset_state_action_is_configurable() {
+        let config: UiConfig = toml::from_str(
+            r#"
+            [[keyboard.bindings]]
+            key = "R"
+            mods = "Alt"
+            action = "ResetState"
+        "#,
+        )
+        .unwrap();
+
+        assert!(config.key_bindings().iter().any(|binding| binding.action == Action::ResetState));
     }
 }
