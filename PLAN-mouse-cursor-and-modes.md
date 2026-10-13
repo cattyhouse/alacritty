@@ -9,12 +9,14 @@
       重新计算并生效，不再停留在点击瞬间的手形。
       Failure behavior: 切回来后仍是手形，必须移动鼠标或敲一下 Shift 键才恢复。
       Evidence: 见任务 3，需在真机 GUI 上确认（本环境无法合成点击）。
-- [ ] Given 点击时鼠标按键在焦点被抢走前处于按下状态，when 窗口失焦，
+- [x] Given 点击时鼠标按键在焦点被抢走前处于按下状态，when 窗口失焦，
       then Alacritty 清掉三个按键的按下状态，避免"一直按着左键"的假状态。
       Failure behavior: 切回窗口后 `left_button_state` 仍是 `Pressed`，
       移动鼠标会被当成拖拽。
-      Evidence: 任务 3 `[source]` 代码路径 + 真机检查。
-- [ ] 现有 `alacritty` 单元测试全部通过（无副作用回归）。
+      Evidence: `Focused(false)` 分支已在真实 App 上执行（`--print-events` 输出
+      `Focused(false)`，见任务 3）`[measured]`；赋值本身 `[source]`。
+- [x] 现有 `alacritty` 单元测试全部通过（无副作用回归）。
+      Evidence: `cargo test -p alacritty` → 91 passed, 0 failed `[measured]`。
 
 ### #6880 程序异常退出后终端模式残留
 
@@ -62,8 +64,11 @@
 3. `alacritty`：焦点回到窗口时强制刷新光标形状 + 清掉卡住的按键状态。
    Done = 代码路径可追溯，真机点一次链接确认。
    Could fail at: winit 与 AppKit 都有"形状没变就跳过"的缓存，必须绕过。
-   Status: 代码 DONE `[source]`；真机 GUI 确认 PENDING（本机 osascript 驱动点击
-   超时、无 GUI 自动化权限，无法合成 Cmd+Click）。
+   Status: 代码 DONE。三条新路径都在真实 App 里跑过且无 panic `[measured]`：
+   `/Applications/Alacritty.app/Contents/MacOS/alacritty --print-events` 输出
+   `Focused(false)`、`Focused(true)`、`CursorEntered { .. }`，日志无 panic。
+   视觉确认（点击链接后切回不再显示手形）仍 PENDING：本机无法合成 Cmd+Click
+   （osascript 调 System Events 超时、无 GUI 自动化权限），需用户手动点一次。
 
 4. `ResetState` 按键动作 + 文档（manpage / features.md / CHANGELOG）。
    Done = 配置能解析并触发。
@@ -73,7 +78,10 @@
 5. 构建 release + 打包安装到 `/Applications/Alacritty.app`。
    Done = `--version` 报告新的本地 commit。
    Could fail at: 编译失败、替换时 Alacritty 正在运行。
-   Status: 进行中 — `cargo build --release` rc=0、`make app` rc=0。
+   Status: DONE `[measured]` — `cargo build --release` rc=0、`make app` rc=0，
+   安装后 `/Applications/Alacritty.app/Contents/MacOS/alacritty --version`
+   → `alacritty 0.18.0-dev (f0f81a69)`，二进制 sha256 由
+   `2e4b3eee…582fb` 变为 `b6679d33…1cb44`（确认真的替换了），adhoc 签名正常。
 
 ## 说明：为什么 #6880 不能做到"全自动"
 
