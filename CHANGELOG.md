@@ -21,6 +21,7 @@ Notable changes to the `alacritty_terminal` crate are documented in its
 - Lacking permissions to launch software sending Apple events
 - Off-by-one in vi mode ParagraphUp action
 - Unbounded per-cell memory usage for zero-width cells
+- Unbounded Kitty keyboard mode stack size
 - Mouse shape sticking to the hyperlink hand after clicking a link which moved the
     focus to another application
 - Mouse tracking modes 1000/1002/1003 no longer disable each other, so a program
