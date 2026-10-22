@@ -166,7 +166,7 @@ IME 停用期间也持续推送位置（`display/mod.rs`，12 行）。这样 IM
 
 ### 已知局限
 
-**视觉确认仍未做**（见 `PLAN-mouse-cursor-and-modes.md` 验收清单第一项，仍是未勾选状态）：本机无法合成 Cmd+Click（没有 GUI 自动化权限），需要手动点一次超链接、切回来看手形是否立刻恢复。代码路径已在真实 App 里跑过且无 panic（`--print-events` 能看到 `Focused(false)` / `Focused(true)` / `CursorEntered`）。
+视觉确认已做（2026-10-22 真机手动点一次超链接、切回确认）：光标形状立刻按当前鼠标位置重新计算并生效，不再停留在点击瞬间的手形。代码路径也已在真实 App 里跑过且无 panic（`--print-events` 能看到 `Focused(false)` / `Focused(true)` / `CursorEntered`）。
 
 ---
 

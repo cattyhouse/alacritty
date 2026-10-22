@@ -4,11 +4,13 @@
 
 ### #6947 点击链接后鼠标停在"手形"
 
-- [ ] Given 鼠标停在超链接上（Alacritty 显示手形），when 点击链接把焦点交给
+- [x] Given 鼠标停在超链接上（Alacritty 显示手形），when 点击链接把焦点交给
       浏览器、再切回 Alacritty 且鼠标没有移动，then 光标形状立刻按当前鼠标位置
       重新计算并生效，不再停留在点击瞬间的手形。
       Failure behavior: 切回来后仍是手形，必须移动鼠标或敲一下 Shift 键才恢复。
-      Evidence: 见任务 3，需在真机 GUI 上确认（本环境无法合成点击）。
+      Evidence: 2026-10-22 用户在真机 GUI 上手动确认通过 —— 点击链接把焦点交给
+      浏览器、再切回 Alacritty 且鼠标未移动时，光标形状立刻按当前鼠标位置重新计算
+      并生效，不再停留在点击瞬间的手形 `[measured]`。
 - [x] Given 点击时鼠标按键在焦点被抢走前处于按下状态，when 窗口失焦，
       then Alacritty 清掉三个按键的按下状态，避免"一直按着左键"的假状态。
       Failure behavior: 切回窗口后 `left_button_state` 仍是 `Pressed`，
@@ -67,8 +69,9 @@
    Status: 代码 DONE。三条新路径都在真实 App 里跑过且无 panic `[measured]`：
    `/Applications/Alacritty.app/Contents/MacOS/alacritty --print-events` 输出
    `Focused(false)`、`Focused(true)`、`CursorEntered { .. }`，日志无 panic。
-   视觉确认（点击链接后切回不再显示手形）仍 PENDING：本机无法合成 Cmd+Click
-   （osascript 调 System Events 超时、无 GUI 自动化权限），需用户手动点一次。
+   视觉确认（点击链接后切回不再显示手形）DONE：2026-10-22 用户在真机 GUI 上手动
+   点一次超链接、切回确认手形不再残留 `[measured]`。本机仍无法合成 Cmd+Click
+   （osascript 调 System Events 超时、无 GUI 自动化权限），故该步只能由人工完成。
 
 4. `ResetState` 按键动作 + 文档（manpage / features.md / CHANGELOG）。
    Done = 配置能解析并触发。
