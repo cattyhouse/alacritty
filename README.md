@@ -1,6 +1,6 @@
 # Alacritty (cattyhouse fork)
 
-基于上游 [alacritty/alacritty](https://github.com/alacritty/alacritty)，针对 **macOS / Apple Silicon** 修三个具体问题。
+基于上游 [alacritty/alacritty](https://github.com/alacritty/alacritty)，针对 **macOS / Apple Silicon** 修五个具体问题。
 
 上游文档（安装、配置项、功能列表）见 `INSTALL.md` 与 [docs/features.md](docs/features.md)；本文只写这个 fork 相对上游多出来的东西。
 
@@ -39,6 +39,8 @@ cat testdata/cjk_bucket.txt
 批次打断次数从「随内容增长而暴增」收敛为「当帧用到的贴图张数」。
 
 因为格子在屏幕上互不重叠，重排绘制顺序不会改变画面。
+
+另外把「每个格子分配一个 `vec![glyph]`」也去掉了：主字形直接放在结构体里，组合符号留在不分配的 `Vec::new()` 里。绝大多数格子根本没有组合符号，原来那一小块堆分配纯属白付。实测连续滚动 500×140 的中文网格 22 秒，分配器采样从 51 降到 4。
 
 ### 实测
 
@@ -146,6 +148,66 @@ IME 停用期间也持续推送位置（`display/mod.rs`，12 行）。这样 IM
 
 ---
 
+## 修复四：点链接后鼠标形状卡在「手形」
+
+### 症状
+
+点一下超链接（焦点跳到浏览器），切回 alacritty 后，鼠标**仍然显示手形**，必须动一下鼠标才恢复。
+
+### 原因
+
+光标形状被窗口系统缓存，而且**只在鼠标移动时**才重新解析；窗口不是前台时，系统不派发鼠标移动。点链接那一刻形状被记成手形，切回来时形状「没变」，缓存继续生效 → 手形留在屏幕上。
+
+### 做法
+
+- 窗口重新获得焦点、或鼠标重新进入窗口时，强制重新应用一次光标形状（`display/window.rs`）。
+- macOS 上额外调 `invalidateCursorRectsForView`，让系统按当前鼠标位置**重新解析**形状。这一步是必须的，否则「形状没变就跳过」的缓存还在。
+- 同时清掉三个鼠标按键的按下状态：点按中途焦点被别的应用抢走时，松开事件会被吞掉，切回来后状态仍是「左键按着」，一动鼠标就被当成拖拽。
+
+### 已知局限
+
+**视觉确认仍未做**（见 `PLAN-mouse-cursor-and-modes.md` 验收清单第一项，仍是未勾选状态）：本机无法合成 Cmd+Click（没有 GUI 自动化权限），需要手动点一次超链接、切回来看手形是否立刻恢复。代码路径已在真实 App 里跑过且无 panic（`--print-events` 能看到 `Focused(false)` / `Focused(true)` / `CursorEntered`）。
+
+---
+
+## 修复五：终端模式残留 & 一键软复位
+
+### 症状
+
+1. 应用同时开启 1000 + 1002 + 1003 三种鼠标上报模式时，后一个模式会把前一个清掉 —— tmux 的 `set -g mouse on` 正是这么设的，于是点击上报丢失。
+2. 程序异常退出（典型如 ssh 断线）没恢复终端状态：点击变成转义序列而不是选文字、滚轮滚应用而不是回滚历史、停在备用屏出不来。
+
+### 原因
+
+- 鼠标追踪模式在协议上是**累积**的（1002 扩展 1000，1003 扩展 1002），上游实现却是「最后一个覆盖前面」。
+- 终端模式残留**没法自动检测**：`alacritty_terminal` 只在 **pty 的直接子进程**（登录 shell 本身）退出时才会收到 `ChildEvent::Exited`。`ssh` 是 shell 的子进程，它死掉时 alacritty 收不到任何事件 —— 屏幕不重绘、鼠标位置不变、也没有退出通知。任何基于猜测的自动复位都会误伤 `vim` / `less` / `git` 这类会切换前台进程组的正常程序。
+
+### 做法
+
+1. `alacritty_terminal`：鼠标上报模式改为累积式；`1002l` 只清自己那一位，不再连带清掉 1003。
+2. 新增 `Term::soft_reset()` 与 `ResetState` 按键动作：重置所有终端模式、退出备用屏，但**不清显示缓冲、不清回滚历史** —— 与 `ESC c` 不同，后者会把屏幕擦掉。
+
+### 用法
+
+```toml
+[[keyboard.bindings]]
+key = "R"
+mods = "Alt"
+action = "ResetState"
+```
+
+用来替掉 `sshcls` 这类 printf 式 shell 包装函数。
+
+### 覆盖情况
+
+| 回归测试 | 覆盖的行为 |
+|---|---|
+| `mouse_tracking_modes_are_cumulative` | 三个模式同时保持；旧逻辑下失败于 `term.mode.contains(TermMode::MOUSE_REPORT_CLICK)` |
+| `soft_reset_restores_modes_and_keeps_history` | 模式复位、退出备用屏，且 `history_size` 不变、可见内容仍含原文本 |
+| `reset_state_action_is_configurable` | TOML 里写 `"ResetState"` 能被解析、按键能触发 |
+
+---
+
 ## 仓库内容
 
 | 路径 | 说明 |
@@ -153,7 +215,9 @@ IME 停用期间也持续推送位置（`display/mod.rs`，12 行）。这样 IM
 | `PLAN-bucket-sort.md` | 中文渲染方案：设计、验收标准、实测数据、复现步骤 |
 | `PLAN-xtmodkeys-shim.md` | Ctrl+Shift+字母方案 |
 | `PLAN-ime-cursor-position.md` | 输入法候选窗位置方案：根因、实测时间线、未验证项 |
+| `PLAN-mouse-cursor-and-modes.md` | 鼠标形状与终端模式方案：验收标准、实测证据、已知边界 |
 | `docs/cjk.fix.discuss.md` | 方案演进与评审记录（含一个被否决的动态扩容方案，勿照此实现） |
+| `docs/features.md` | 上游功能文档，本 fork 追加了「从损坏的终端状态恢复」一节 |
 | `testdata/cjk_bucket.txt` | 渲染卡顿复现语料：240 行 × 140 字，3199 个不重复汉字 |
 | `FORK.md` | 分支与远端工作流 |
 
