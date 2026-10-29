@@ -15,6 +15,11 @@ Notable changes to the `alacritty_terminal` crate are documented in its
 - Fixed `alacritty-escapes(7)` manpage missing from macOS install
 - Added the `Open Alacritty here` entry to the right-click context menu for folders on Windows
 
+### Added
+
+- `ResetState` key binding action, which resets the terminal modes and leaves the
+    alternate screen without clearing the display buffer or the scrollback
+
 ### Fixed
 
 - Spurious "Failed to set new owner of XCB selection" warnings on X11
@@ -22,15 +27,11 @@ Notable changes to the `alacritty_terminal` crate are documented in its
 - Off-by-one in vi mode ParagraphUp action
 - Unbounded per-cell memory usage for zero-width cells
 - Unbounded Kitty keyboard mode stack size
+- Keyboard and mouse bindings missing from `alacritty msg get-config` output
 - Mouse shape sticking to the hyperlink hand after clicking a link which moved the
     focus to another application
 - Mouse tracking modes 1000/1002/1003 no longer disable each other, so a program
     requesting several of them keeps all of them
-
-### Added
-
-- `ResetState` key binding action, which resets the terminal modes and leaves the
-    alternate screen without clearing the display buffer or the scrollback
 
 ## 0.17.0
 
