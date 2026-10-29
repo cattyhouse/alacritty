@@ -49,7 +49,7 @@
 
 | 编号 | 场景 | 期望 | 证据 |
 |---|---|---|---|
-| AC1 | Legacy 下 `Shift+Enter` | 发出 `\x1b[27;2;13~`，经 tmux 到应用变成 `\x1b[13;2u`（pi 判定为 shift+enter） | 单测 `legacy_enter_keeps_modifiers`；tmux 探针 `z_enter_x` |
+| AC1 | Legacy 下 `Shift+Enter` | 发出 `\x1b[27;2;13~`，经 tmux 到应用变成 `\x1b[13;2u`（pi 判定为 shift+enter） | 单测 `legacy_enter_keeps_modifiers`；tmux 探针 `z_enter_x`；**真机实测**：2026-10-29 在 tmux 里运行 pi，搜索界面按 `Shift+Enter` 触发 Previous（不再等同 Enter 的 Next） |
 | AC2 | `Ctrl+Enter` / `Ctrl+Shift+Enter` / `Alt+Shift+Enter` | `\x1b[27;5;13~` / `\x1b[27;6;13~` / `\x1b[27;4;13~`，经 tmux 变 `\x1b[13;5u` / `\x1b[13;6u` / `\x1b[13;4u` | 单测 + 探针 `z_cent_x`/`z_csent_x`/`z_asent_x` |
 | AC3 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | `\x1b[27;5;9~` / `\x1b[27;6;9~` | 单测 + 探针 `z_ctab_x`（tmux 会把 `Ctrl+Shift+Tab` 归一成 `\x1b[Z`，属 tmux 自身行为） |
 | AC4 | `Shift+Esc` | `\x1b[27;2;27~` | 单测 + 探针 `z_esc_x` |
@@ -88,7 +88,8 @@
 
 ## 未验证项
 
-- **真键盘事件**：自动化验证覆盖到"alacritty 会发出的字节"和"这些字节经 tmux 到达应用"两段，
-  唯一没有自动化的是物理按键到字节这一段（需要 macOS 辅助功能权限注入按键）。
-  需人工在真实窗口里按 `Shift+Enter` 确认。
+- 真键盘事件：末段已在真实环境确认（见 AC1）—— 在 tmux 里运行 pi，按 `Shift+Enter` 从 Next 变为 Previous，问题解决。
+  自动化只能覆盖到"alacritty 会发出的字节"与"这些字节经 tmux 到达应用"两段，物理按键→字节这一段依赖人工确认。
+- 其余组合（`Ctrl+Shift+Tab`、`Shift+Esc`、`Ctrl+Shift+Space`、`Ctrl+Shift+Backspace`、`Ctrl+Shift+数字/符号`）
+  只验证到字节与 tmux 链路，未逐个在真实窗口按过。
 - Windows / Wayland 等非 macOS 平台未实测。
