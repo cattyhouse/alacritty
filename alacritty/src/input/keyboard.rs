@@ -258,31 +258,117 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     }
 }
 
-/// Lowercase codepoint for Ctrl+Shift+ASCII-letter, which has no legacy encoding
-/// (Shift is silently lost, e.g. Ctrl+Shift+F arrives downstream as bare 0x06 like
-/// Ctrl+F). Callers encode it Kitty-style even when no keyboard protocol was
-/// negotiated. This mirrors what Ghostty sends unprompted and lets tmux forward the
-/// Shift bit (mods 6) instead of dropping it.
-fn ctrl_shift_letter_codepoint<S: AsRef<str>>(
-    logical: &Key<S>,
-    ctrl: bool,
-    shift: bool,
-) -> Option<u32> {
-    if !ctrl || !shift {
+/// A key press that the legacy encoding cannot represent, together with the
+/// sequence which carries the modifier information instead.
+struct LegacySequence {
+    payload: Cow<'static, str>,
+    terminator: SequenceTerminator,
+    /// The payload already reports the modifiers itself, so the formatter must not
+    /// append them a second time.
+    mods_in_payload: bool,
+}
+
+impl LegacySequence {
+    /// Convert into a [`SequenceBase`], clearing the modifiers the payload carries.
+    fn into_base(self, modifiers: &mut SequenceModifiers) -> SequenceBase {
+        if self.mods_in_payload {
+            *modifiers = SequenceModifiers::empty();
+        }
+
+        SequenceBase::new(self.payload, self.terminator)
+    }
+}
+
+/// Return the character if `text` is exactly one printable ASCII character.
+fn single_ascii_char(text: &str) -> Option<char> {
+    let mut chars = text.chars();
+    let character = chars.next()?;
+    if chars.next().is_some() || !character.is_ascii() || character.is_ascii_control() {
         return None;
     }
 
+    Some(character)
+}
+
+/// Sequence for keys whose modifiers legacy encoding silently drops.
+///
+/// Terminals only use the Kitty protocol when the application asked for it, but a
+/// multiplexer like tmux never forwards that request to the outer terminal. The
+/// keys below therefore arrive without their modifiers (e.g. Shift+Enter is
+/// indistinguishable from Enter), so they are encoded explicitly instead.
+///
+/// Two shapes are used, matching what the ecosystem already understands when no
+/// protocol is negotiated:
+///
+/// - Named keys use xterm's `modifyOtherKeys` form (`CSI 27;<mods>;<code>~`), the
+///   same shape Ghostty uses for them. It stays parseable for programs which only
+///   know xterm's extended keys.
+/// - Character keys use Kitty's `CSI <codepoint>;<mods>u`, which is how the Shift
+///   bit survives for Ctrl+Shift+<character>.
+///
+/// Plain typing (Shift alone, Shift+Space), well-defined legacy keys (Ctrl+C as
+/// 0x03, Ctrl+Space as 0x00, Alt as ESC prefix) and anything which is not a single
+/// ASCII character keep their existing encoding.
+fn legacy_sequence(
+    logical: &Key,
+    unmodded: Option<&Key>,
+    modifiers: SequenceModifiers,
+) -> Option<LegacySequence> {
+    let ctrl = modifiers.contains(SequenceModifiers::CONTROL);
+    let shift = modifiers.contains(SequenceModifiers::SHIFT);
+
+    // xterm's `modifyOtherKeys` form for named keys, with the modifiers embedded.
+    let xterm = |code: &str| {
+        let mods = modifiers.encode_esc_sequence();
+        Some(LegacySequence {
+            payload: format!("27;{mods};{code}").into(),
+            terminator: SequenceTerminator::Normal('~'),
+            mods_in_payload: true,
+        })
+    };
+
     match logical {
-        Key::Character(ch) => {
-            let text = ch.as_ref();
-            if text.chars().count() == 1
-                && matches!(text.chars().next(), Some(c) if c.is_ascii_alphabetic())
-            {
-                text.chars().next().map(|c| u32::from(c.to_ascii_lowercase()))
-            } else {
-                None
-            }
+        // Enter is `\r` (0x0D) regardless of Shift and/or Ctrl.
+        Key::Named(NamedKey::Enter) if shift || ctrl => xterm("13"),
+
+        // Tab is `\t` (0x09), and Shift+Tab is the well-known `\x1b[Z` binding.
+        Key::Named(NamedKey::Tab) if ctrl => xterm("9"),
+
+        // Escape is `\x1b` (0x1B). Alt is excluded since `\x1b\x1b` is its own
+        // well-known representation.
+        Key::Named(NamedKey::Escape) if shift || ctrl => xterm("27"),
+
+        // Space is `\x00` for Ctrl+Space, while Shift+Space must stay plain text.
+        Key::Named(NamedKey::Space) if ctrl && shift => xterm("32"),
+
+        // Backspace is `0x08` for Ctrl+Backspace, Shift alone stays `0x7f`.
+        Key::Named(NamedKey::Backspace) if ctrl && shift => xterm("127"),
+
+        // Ctrl+Shift+<character> collapses into the same C0 byte as Ctrl+<character>
+        // (`0x06` for both Ctrl+F and Ctrl+Shift+F).
+        //
+        // Restricted to a single ASCII character: text coming from international
+        // layouts or IME composition keeps its existing (textual) encoding instead of
+        // being dropped or turned into an out-of-range codepoint.
+        Key::Character(ch) if ctrl && shift => {
+            let character = single_ascii_char(ch.as_ref())?;
+            let base = match unmodded.map(Key::as_ref) {
+                Some(Key::Character(base)) => single_ascii_char(base.as_ref()),
+                _ => None,
+            };
+
+            // Letters are reported lowercase, like Kitty and Ghostty do. Digits and
+            // symbols use the unshifted key, so Ctrl+Shift+1 is `CSI 49;6u` rather
+            // than the codepoint of `!`.
+            let codepoint = u32::from(base.unwrap_or(character).to_ascii_lowercase());
+
+            Some(LegacySequence {
+                payload: codepoint.to_string().into(),
+                terminator: SequenceTerminator::Kitty,
+                mods_in_payload: false,
+            })
         },
+
         _ => None,
     }
 }
@@ -313,13 +399,12 @@ fn should_build_sequence(
 
     match logical {
         _ if disambiguate => true,
-        // Legacy cannot carry Shift together with Ctrl on letters; encode it so the
-        // Shift bit survives hosts that never negotiate a protocol (e.g. tmux).
-        _ if ctrl_shift_letter_codepoint(logical, mods.control_key(), mods.shift_key())
-            .is_some() =>
-        {
-            true
-        },
+        // Legacy cannot carry the modifiers of these keys, so they are encoded
+        // explicitly even when no protocol was negotiated (e.g. behind tmux).
+        //
+        // The unshifted key only refines the codepoint of character keys, never
+        // whether a sequence is built, so it is not needed for this decision.
+        _ if legacy_sequence(logical, None, mods.into()).is_some() => true,
         // Exclude all the named keys unless they have textual representation.
         Key::Named(named) => named.to_text().is_none(),
         _ => text.is_empty(),
@@ -354,8 +439,19 @@ fn build_sequence(key: KeyEvent, mods: ModifiersState, mode: TermMode) -> Vec<u8
             && !is_control_character(text)
     });
 
-    let sequence_base = context
-        .try_build_numpad(&key)
+    // Without a negotiated protocol, the legacy encodings below silently drop the
+    // modifiers of some keys (e.g. Shift+Enter arrives as plain `\r`), so emit an
+    // explicit sequence for exactly those keys.
+    let unmodded = key.key_without_modifiers();
+    let legacy_base = if kitty_seq || kitty_encode_all {
+        None
+    } else {
+        legacy_sequence(&key.logical_key, Some(&unmodded), modifiers)
+            .map(|sequence| sequence.into_base(&mut modifiers))
+    };
+
+    let sequence_base = legacy_base
+        .or_else(|| context.try_build_numpad(&key))
         .or_else(|| context.try_build_named_kitty(&key))
         .or_else(|| context.try_build_named_normal(&key, associated_text.is_some()))
         .or_else(|| context.try_build_control_char_or_mod(&key, &mut modifiers))
@@ -366,21 +462,37 @@ fn build_sequence(key: KeyEvent, mods: ModifiersState, mode: TermMode) -> Vec<u8
         _ => return Vec::new(),
     };
 
-    let mut payload = format!("\x1b[{payload}");
-
-    // Add modifiers information.
-    if kitty_event_type || !modifiers.is_empty() || associated_text.is_some() {
-        payload.push_str(&format!(";{}", modifiers.encode_esc_sequence()));
-    }
-
     // Push event type.
-    if kitty_event_type {
-        payload.push(':');
-        let event_type = match key.state {
+    let event_type = if kitty_event_type {
+        Some(match key.state {
             _ if key.repeat => '2',
             ElementState::Pressed => '1',
             ElementState::Released => '3',
-        };
+        })
+    } else {
+        None
+    };
+
+    render_sequence(&payload, terminator, modifiers, event_type, associated_text)
+}
+
+/// Render the final escape sequence from its parts.
+fn render_sequence(
+    payload: &str,
+    terminator: SequenceTerminator,
+    modifiers: SequenceModifiers,
+    event_type: Option<char>,
+    associated_text: Option<&str>,
+) -> Vec<u8> {
+    let mut payload = format!("\x1b[{payload}");
+
+    // Add modifiers information.
+    if event_type.is_some() || !modifiers.is_empty() || associated_text.is_some() {
+        payload.push_str(&format!(";{}", modifiers.encode_esc_sequence()));
+    }
+
+    if let Some(event_type) = event_type {
+        payload.push(':');
         payload.push(event_type);
     }
 
@@ -418,18 +530,6 @@ impl SequenceBuilder {
         key: &KeyEvent,
         associated_text: Option<&str>,
     ) -> Option<SequenceBase> {
-        // Legacy Ctrl+Shift+letter fallback: encode Kitty-style without alternate keys,
-        // since none were negotiated. In legacy mode (`!kitty_seq`) every other
-        // Character key keeps falling through to `None` below, as before.
-        if !self.kitty_seq && !self.kitty_encode_all {
-            return ctrl_shift_letter_codepoint(
-                &key.logical_key.as_ref(),
-                self.modifiers.contains(SequenceModifiers::CONTROL),
-                self.modifiers.contains(SequenceModifiers::SHIFT),
-            )
-            .map(|code| SequenceBase::new(code.to_string().into(), SequenceTerminator::Kitty));
-        }
-
         let character = match key.logical_key.as_ref() {
             Key::Character(character) if self.kitty_seq => character,
             _ => return None,
@@ -772,37 +872,252 @@ mod tests {
     use super::*;
     use winit::keyboard::SmolStr;
 
+    fn named(key: NamedKey) -> Key {
+        Key::Named(key)
+    }
+
+    fn character(ch: &str) -> Key {
+        Key::Character(SmolStr::from(ch))
+    }
+
+    /// Render the legacy fallback the same way `build_sequence` does, so the tests
+    /// assert the bytes alacritty actually writes to the pty.
+    fn legacy_bytes(logical: &Key, unmodded: Option<&Key>, mods: ModifiersState) -> Option<String> {
+        let mut modifiers: SequenceModifiers = mods.into();
+        let sequence = legacy_sequence(logical, unmodded, modifiers)?;
+        let base = sequence.into_base(&mut modifiers);
+        let bytes = render_sequence(&base.payload, base.terminator, modifiers, None, None);
+
+        Some(String::from_utf8(bytes).unwrap())
+    }
+
     #[test]
-    fn ctrl_shift_letter_resolves_lowercase_codepoint() {
+    fn legacy_enter_keeps_modifiers() {
+        // Legacy sends plain `\r` for every one of these.
+        let enter = named(NamedKey::Enter);
         assert_eq!(
-            ctrl_shift_letter_codepoint(&Key::<SmolStr>::Character(SmolStr::from("F")), true, true),
-            Some(102)
+            legacy_bytes(&enter, None, ModifiersState::SHIFT).as_deref(),
+            Some("\x1b[27;2;13~")
         );
-        // Shift alone (typing capitals) and Ctrl alone keep legacy behavior.
         assert_eq!(
-            ctrl_shift_letter_codepoint(&Key::<SmolStr>::Character(SmolStr::from("F")), false, true),
+            legacy_bytes(&enter, None, ModifiersState::CONTROL).as_deref(),
+            Some("\x1b[27;5;13~")
+        );
+        assert_eq!(
+            legacy_bytes(&enter, None, ModifiersState::CONTROL | ModifiersState::SHIFT).as_deref(),
+            Some("\x1b[27;6;13~")
+        );
+        assert_eq!(
+            legacy_bytes(&enter, None, ModifiersState::ALT | ModifiersState::SHIFT).as_deref(),
+            Some("\x1b[27;4;13~")
+        );
+        assert_eq!(
+            legacy_bytes(
+                &enter,
+                None,
+                ModifiersState::CONTROL | ModifiersState::ALT | ModifiersState::SHIFT
+            )
+            .as_deref(),
+            Some("\x1b[27;8;13~")
+        );
+
+        // Plain Enter stays `\r`, Alt+Enter stays the well-known ESC prefix.
+        assert_eq!(legacy_bytes(&enter, None, ModifiersState::empty()), None);
+        assert_eq!(legacy_bytes(&enter, None, ModifiersState::ALT), None);
+    }
+
+    #[test]
+    fn legacy_tab_keeps_ctrl() {
+        let tab = named(NamedKey::Tab);
+        assert_eq!(
+            legacy_bytes(&tab, None, ModifiersState::CONTROL).as_deref(),
+            Some("\x1b[27;5;9~")
+        );
+        assert_eq!(
+            legacy_bytes(&tab, None, ModifiersState::CONTROL | ModifiersState::SHIFT).as_deref(),
+            Some("\x1b[27;6;9~")
+        );
+
+        // Shift+Tab must keep its default binding (`\x1b[Z`).
+        assert_eq!(legacy_bytes(&tab, None, ModifiersState::SHIFT), None);
+    }
+
+    #[test]
+    fn legacy_escape_keeps_modifiers() {
+        let escape = named(NamedKey::Escape);
+        assert_eq!(
+            legacy_bytes(&escape, None, ModifiersState::SHIFT).as_deref(),
+            Some("\x1b[27;2;27~")
+        );
+        assert_eq!(
+            legacy_bytes(&escape, None, ModifiersState::CONTROL).as_deref(),
+            Some("\x1b[27;5;27~")
+        );
+
+        // Plain Escape stays `\x1b`, Alt+Escape stays the double-ESC prefix.
+        assert_eq!(legacy_bytes(&escape, None, ModifiersState::empty()), None);
+        assert_eq!(legacy_bytes(&escape, None, ModifiersState::ALT), None);
+    }
+
+    #[test]
+    fn legacy_space_and_backspace_keep_ctrl_shift() {
+        let space = named(NamedKey::Space);
+        assert_eq!(
+            legacy_bytes(&space, None, ModifiersState::CONTROL | ModifiersState::SHIFT).as_deref(),
+            Some("\x1b[27;6;32~")
+        );
+        // Shift+Space types a space, Ctrl+Space stays the well-defined 0x00.
+        assert_eq!(legacy_bytes(&space, None, ModifiersState::SHIFT), None);
+        assert_eq!(legacy_bytes(&space, None, ModifiersState::CONTROL), None);
+
+        let backspace = named(NamedKey::Backspace);
+        assert_eq!(
+            legacy_bytes(&backspace, None, ModifiersState::CONTROL | ModifiersState::SHIFT)
+                .as_deref(),
+            Some("\x1b[27;6;127~")
+        );
+        // Ctrl+Backspace stays 0x08, Shift+Backspace stays 0x7f.
+        assert_eq!(legacy_bytes(&backspace, None, ModifiersState::CONTROL), None);
+        assert_eq!(legacy_bytes(&backspace, None, ModifiersState::SHIFT), None);
+    }
+
+    #[test]
+    fn legacy_ctrl_shift_character_keeps_shift_bit() {
+        let mods = ModifiersState::CONTROL | ModifiersState::SHIFT;
+
+        // Letters: lowercase base layout key, shift bit preserved.
+        assert_eq!(
+            legacy_bytes(&character("F"), Some(&character("f")), mods).as_deref(),
+            Some("\x1b[102;6u")
+        );
+        // Even without an unshifted key reported by winit.
+        assert_eq!(legacy_bytes(&character("F"), None, mods).as_deref(), Some("\x1b[102;6u"));
+
+        // Digits and symbols: base key, so the application sees Ctrl+Shift+1.
+        assert_eq!(
+            legacy_bytes(&character("!"), Some(&character("1")), mods).as_deref(),
+            Some("\x1b[49;6u")
+        );
+        assert_eq!(
+            legacy_bytes(&character("?"), Some(&character("/")), mods).as_deref(),
+            Some("\x1b[47;6u")
+        );
+
+        // Ctrl alone and Shift alone keep their legacy encoding (0x06, capital F).
+        assert_eq!(
+            legacy_bytes(&character("f"), Some(&character("f")), ModifiersState::CONTROL),
             None
         );
         assert_eq!(
-            ctrl_shift_letter_codepoint(&Key::<SmolStr>::Character(SmolStr::from("f")), true, false),
+            legacy_bytes(&character("F"), Some(&character("f")), ModifiersState::SHIFT),
             None
         );
-        // Non-letters are untouched.
-        assert_eq!(
-            ctrl_shift_letter_codepoint(&Key::<SmolStr>::Named(NamedKey::Enter), true, true),
-            None
-        );
+    }
+
+    #[test]
+    fn legacy_character_fallback_never_swallows_text() {
+        let mods = ModifiersState::CONTROL | ModifiersState::SHIFT;
+
+        // Text with more than one codepoint (IME composition) and non-ASCII
+        // characters must keep the normal text path instead of producing nothing or
+        // an out-of-range codepoint.
+        assert_eq!(legacy_bytes(&character("e\u{301}"), Some(&character("e")), mods), None);
+        assert_eq!(legacy_bytes(&character("\u{e4}"), Some(&character("\u{e4}")), mods), None);
+    }
+
+    #[test]
+    fn legacy_gate_matches_encoder() {
+        // `should_build_sequence` must never send a key into the encoder that the
+        // encoder then drops: the two decisions are the same function.
+        let key_mods = [
+            ModifiersState::empty(),
+            ModifiersState::SHIFT,
+            ModifiersState::CONTROL,
+            ModifiersState::ALT,
+            ModifiersState::CONTROL | ModifiersState::SHIFT,
+            ModifiersState::ALT | ModifiersState::SHIFT,
+            ModifiersState::CONTROL | ModifiersState::ALT | ModifiersState::SHIFT,
+        ];
+
+        let keys: Vec<(Key, &str)> = vec![
+            (named(NamedKey::Enter), "\r"),
+            (named(NamedKey::Tab), "\t"),
+            (named(NamedKey::Escape), "\x1b"),
+            (named(NamedKey::Space), " "),
+            (named(NamedKey::Backspace), "\x7f"),
+            (character("F"), "\x06"),
+            (character("!"), "\x01"),
+            (character("e\u{301}"), "\x05"),
+            (character("\u{e4}"), "\x04"),
+        ];
+
+        for (key, text) in &keys {
+            for mods in key_mods {
+                let gate = should_build_sequence(
+                    key,
+                    KeyLocation::Standard,
+                    text,
+                    TermMode::empty(),
+                    mods,
+                );
+                let encoder = legacy_sequence(key, None, mods.into()).is_some();
+                assert_eq!(gate, encoder, "{key:?} with {mods:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn negotiated_protocol_behavior_is_unchanged() {
+        // With DISAMBIGUATE negotiated the pre-existing logic decides, exactly as
+        // before this change: Shift+Enter and Shift+Tab build sequences, plain text
+        // keys do not.
+        let mode = TermMode::DISAMBIGUATE_ESC_CODES;
+        assert!(should_build_sequence(
+            &named(NamedKey::Enter),
+            KeyLocation::Standard,
+            "\r",
+            mode,
+            ModifiersState::SHIFT,
+        ));
+        assert!(should_build_sequence(
+            &named(NamedKey::Tab),
+            KeyLocation::Standard,
+            "\t",
+            mode,
+            ModifiersState::SHIFT,
+        ));
+        assert!(!should_build_sequence(
+            &character("F"),
+            KeyLocation::Standard,
+            "F",
+            mode,
+            ModifiersState::SHIFT,
+        ));
+        assert!(!should_build_sequence(
+            &named(NamedKey::Enter),
+            KeyLocation::Standard,
+            "\r",
+            mode,
+            ModifiersState::empty(),
+        ));
     }
 
     #[test]
     fn ctrl_shift_letter_disambiguated_without_protocol() {
         let mods = ModifiersState::CONTROL | ModifiersState::SHIFT;
         assert!(should_build_sequence(
-            &Key::<SmolStr>::Character(SmolStr::from("F")),
+            &character("F"),
             KeyLocation::Standard,
             "\x06",
             TermMode::empty(),
             mods,
+        ));
+        assert!(should_build_sequence(
+            &named(NamedKey::Enter),
+            KeyLocation::Standard,
+            "\r",
+            TermMode::empty(),
+            ModifiersState::SHIFT,
         ));
     }
 
@@ -810,7 +1125,7 @@ mod tests {
     fn shift_only_letter_stays_legacy() {
         // Shift+F without Ctrl types capital F; must not become an escape sequence.
         assert!(!should_build_sequence(
-            &Key::<SmolStr>::Character(SmolStr::from("F")),
+            &character("F"),
             KeyLocation::Standard,
             "F",
             TermMode::empty(),
@@ -822,7 +1137,7 @@ mod tests {
     fn ctrl_only_letter_stays_legacy() {
         // Bare Ctrl+F keeps its well-defined 0x06 (tmux maps it to CSI 102;5u itself).
         assert!(!should_build_sequence(
-            &Key::<SmolStr>::Character(SmolStr::from("f")),
+            &character("f"),
             KeyLocation::Standard,
             "\x06",
             TermMode::empty(),

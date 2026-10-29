@@ -69,28 +69,50 @@ Apple M1 / macOS 27.2，`testdata/cjk_bucket.txt`（3199 个不重复汉字）�
 
 ---
 
-## 修复二：Ctrl+Shift+字母在 tmux 下收不到
+## 修复二：Shift/Ctrl 组合键在 tmux 下收不到
 
 ### 症状
 
-在 tmux 里运行的 TUI 应用（例如 pi）收不到 `Ctrl+Shift+F` 之类的组合键。
+在 tmux 里运行的 TUI 应用（例如 pi）收不到这些组合键：
+
+- `Shift+Enter`（pi 搜索界面里本该是 Previous，却和 Enter 一样触发 Next）
+- `Ctrl+Shift+F`、`Ctrl+Shift+数字/符号`
+- `Ctrl+Tab` / `Ctrl+Shift+Tab`、`Shift+Esc`、`Ctrl+Shift+Space`、`Ctrl+Shift+Backspace`
 
 ### 原因
 
-终端的传统编码无法表达 Shift 与字母的组合 —— `Ctrl+Shift+F` 和 `Ctrl+F` 只能发出同一个字节 `0x06`。
+传统终端编码压掉了修饰键：`Shift+Enter` 与 `Enter` 都只能是裸 `\r`（`0x0D`），
+`Ctrl+Shift+F` 与 `Ctrl+F` 都只能是 `0x06`。
 
-应用需要 kitty 键盘协议才能区分，但 pi 这类应用拿不到 kitty 协商时会降级发 `CSI > 4;2 m`（xterm modifyOtherKeys），而 **tmux 3.7 只对外层终端说 modifyOtherKeys，从不转发 kitty**，终端于是停在传统模式。
-
-ghostty 的做法是不依赖协商，直接无条件发出可区分的序列。
+应用要区分它们必须协商键盘协议，但 tmux 不会把 pane 里应用的协商请求转给外层终端 ——
+实测应用只发 kitty 的 `CSI >1u` 时，tmux 3.8 完全不认，仍按裸 `\r` 转发；
+应用于是降级发 xterm 的 `CSI >4;2m`，而 tmux 只据此决定「自己怎么向内层应用回编码」，
+对外层终端依旧只当传统终端。
 
 ### 做法
 
-1. 收到 modifyOtherKeys 请求时改为开启 Kitty DISAMBIGUATE，借用已有的 Kitty 编码器保住修饰键；该状态能跨 Kitty 栈的 push/pop 存活，模式查询也会应答。
-2. 作为兜底，即使没协商任何协议，`Ctrl+Shift+<ASCII 字母>` 也按 Kitty 格式编码 —— 与 ghostty 的做法一致。
+不依赖协商，在传统模式下就为「必然丢信息」的键发显式序列（详见
+[`PLAN-legacy-extended-keys.md`](PLAN-legacy-extended-keys.md)）：
 
-单独 Shift（大写输入）和单独 Ctrl（`0x06`）行为不变；键位绑定仍然优先，因为绑定是先匹配的。
+| 键 | 发出的字节 |
+|---|---|
+| `Shift+Enter` / `Ctrl+Enter` / `Ctrl+Shift+Enter` / `Alt+Shift+Enter` | `\x1b[27;2;13~` / `\x1b[27;5;13~` / `\x1b[27;6;13~` / `\x1b[27;4;13~` |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | `\x1b[27;5;9~` / `\x1b[27;6;9~` |
+| `Shift+Esc` | `\x1b[27;2;27~` |
+| `Ctrl+Shift+Space` / `Ctrl+Shift+Backspace` | `\x1b[27;6;32~` / `\x1b[27;6;127~` |
+| `Ctrl+Shift+字母` / `Ctrl+Shift+数字或符号` | `\x1b[102;6u` / `\x1b[49;6u`（基底键 + Shift 位） |
 
-详见 [`PLAN-xtmodkeys-shim.md`](PLAN-xtmodkeys-shim.md)。
+命名键用 xterm 的 `modifyOtherKeys` 形式（ghostty 在未协商时对同一批键用的就是它），
+字符键用 kitty 的 `CSI <码点>;<修饰>u`。经 tmux 实测，这些字节都会被 tmux 解析后
+以 `CSI …u` 交给内层应用。
+
+**不变的**：单独 Shift（大写字母、上档符号）、`Shift+Space`、单独 Ctrl（`Ctrl+C` 仍是 `0x03`）、
+`Ctrl+Space`（`0x00`）、单独 Alt（ESC 前缀）、`Alt+Enter`、`Shift+Tab`（`\x1b[Z`）；
+键位绑定仍然优先，因为绑定是先匹配的。
+
+输入法提交的多码点文本和非 ASCII 字符不会被兜底吞掉，仍按普通文本发送。
+
+详见 [`PLAN-legacy-extended-keys.md`](PLAN-legacy-extended-keys.md)。
 
 ### 需要注意
 
@@ -213,7 +235,8 @@ action = "ResetState"
 | 路径 | 说明 |
 |---|---|
 | `PLAN-bucket-sort.md` | 中文渲染方案：设计、验收标准、实测数据、复现步骤 |
-| `PLAN-xtmodkeys-shim.md` | Ctrl+Shift+字母方案 |
+| `PLAN-xtmodkeys-shim.md` | modifyOtherKeys 请求 → Kitty DISAMBIGUATE 的兜底 |
+| `PLAN-legacy-extended-keys.md` | 未协商协议时 Shift/Ctrl 组合键的消歧义：设计、与 ghostty 对比、tmux 实测 |
 | `PLAN-ime-cursor-position.md` | 输入法候选窗位置方案：根因、实测时间线、未验证项 |
 | `PLAN-mouse-cursor-and-modes.md` | 鼠标形状与终端模式方案：验收标准、实测证据、已知边界 |
 | `docs/cjk.fix.discuss.md` | 方案演进与评审记录（含一个被否决的动态扩容方案，勿照此实现） |

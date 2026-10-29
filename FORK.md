@@ -61,6 +61,6 @@ git push myfork fix --force-with-lease
 
 ## 本仓库分支说明
 
-- `master`：上游 base 之上的个人补丁（CJK 单 atlas、XTMODKEYS 兜底、Ctrl+Shift+字母区分），构建 `/Applications/Alacritty.app` 就用它。
+- `master`：上游 base 之上的个人补丁（CJK 单 atlas、XTMODKEYS 兜底、未协商协议时的 Shift/Ctrl 组合键消歧义），构建 `/Applications/Alacritty.app` 就用它。
 - `fix`：推给别人看 / 提 PR 用的同内容分支。
 - `myfork/master`：保持可快进，不要在这里直接改东西，所有改动先在本地分支做完再推。
