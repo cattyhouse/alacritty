@@ -19,6 +19,9 @@ Notable changes to the `alacritty_terminal` crate are documented in its
 
 - `ResetState` key binding action, which resets the terminal modes and leaves the
     alternate screen without clearing the display buffer or the scrollback
+- `terminal.extended_key_encoding` option, which reports the modifiers of keys the
+    legacy encoding cannot represent (`Shift+Enter`, `Ctrl+Shift+letter`) even when no
+    keyboard protocol was negotiated, as is the case behind `tmux`
 
 ### Fixed
 
@@ -30,8 +33,8 @@ Notable changes to the `alacritty_terminal` crate are documented in its
 - Keyboard and mouse bindings missing from `alacritty msg get-config` output
 - Mouse shape sticking to the hyperlink hand after clicking a link which moved the
     focus to another application
-- Mouse tracking modes 1000/1002/1003 no longer disable each other, so a program
-    requesting several of them keeps all of them
+- Mouse buttons staying pressed after another application took the focus mid-click, which
+    made the next click of the application look like a drag
 
 ## 0.17.0
 

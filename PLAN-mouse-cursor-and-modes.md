@@ -18,19 +18,18 @@
       Evidence: `Focused(false)` 分支已在真实 App 上执行（`--print-events` 输出
       `Focused(false)`，见任务 3）`[measured]`；赋值本身 `[source]`。
 - [x] 现有 `alacritty` 单元测试全部通过（无副作用回归）。
-      Evidence: `cargo test -p alacritty` → 91 passed, 0 failed `[measured]`。
+      Evidence: `cargo test -p alacritty` → 106 passed, 0 failed `[measured]`。
 
 ### #6880 程序异常退出后终端模式残留
 
-- [x] Given 应用同时开启 1000 + 1002 + 1003（tmux `set -g mouse on` 就是这样），
-      when 解析这些序列，then 三个模式**同时**保持开启（1002 扩展 1000，
-      1003 扩展 1002），而不是"最后一个覆盖前面"。
-      Failure behavior: `1002h` 把 `1000h` 设的点击上报清掉（当前行为，已测出）。
-      Evidence: 回归测试 `mouse_tracking_modes_are_cumulative` — 旧逻辑下
-      失败于 `assertion failed: term.mode.contains(TermMode::MOUSE_REPORT_CLICK)`
-      （`cargo test -p alacritty_terminal --lib mouse_tracking_modes_are_cumulative`），
-      改后通过 `[measured]`。
-- [x] Given 应用开了 1002 + 1003，when 执行 1002l，then 1003 保持开启（只清自己那一位）。
+- [x] Given 应用依次开启 1000、1002、1003，when 解析这些序列，then 终端对外只报告
+      最后一个模式为"已设置"（xterm 的 `send_mouse_pos` 是单值枚举，DECRQM 回答是
+      `MdBool(send_mouse_pos == <mode>)`），不会同时报多个模式为开启。
+      Failure behavior: 三个模式位同时置位，DECRQM 对 1000 和 1002 同时回答"已设置"。
+      Evidence: 回归测试 `mouse_tracking_mode_is_mutually_exclusive`；
+      早期的"累积式"改法实测会让 DECRQM 同时回报 1000 与 1002，已回退 `[measured]`。
+- [x] Given 应用开了 1003（它的超集包含 1002 的语义），when 执行 1002l，
+      then 1003 仍保持开启，只清自己那一位。
       Failure behavior: 1002l 把 1003 也清了。
       Evidence: 同一个回归测试 `[measured]`。
 - [x] Given 终端处于残留状态（鼠标上报 + 备用屏幕 + 括号粘贴 + 插入模式…），
@@ -39,6 +38,17 @@
       Failure behavior: 要么模式没清，要么像 `ESC c` 一样把缓冲区擦掉。
       Evidence: `soft_reset_restores_modes_and_keeps_history` 断言了
       `history_size` 不变、可见内容仍含 "line one"/"line two" `[measured]`。
+- [x] Given 程序退出前把 G0 设成画线字符集、把前景色设成红色、改了窗口标题，
+      when 执行软复位再打字，then 打出来的是普通 ASCII、用的是默认颜色、
+      标题也回到未设置。
+      Failure behavior: 打出来的字是 `─` 之类的画线符号，颜色仍是红色，标题还停在
+      死掉程序设的名字（这些都是最初的 `soft_reset()` 的实测缺陷）。
+      Evidence: `soft_reset_restores_the_writing_state`；逐项去掉修复后该测试分别
+      失败 `[measured]`。
+- [x] Given 用户正停在回滚历史里，when 执行软复位，then 视图回到活动屏，
+      提示符不会写在视口之外。
+      Failure behavior: `display_offset` 保持原值，复位后仍看不见提示符。
+      Evidence: `soft_reset_returns_to_the_live_screen`；去掉修复后失败 `[measured]`。
 - [x] Given 用户想把软复位绑到按键，when 在 `key_bindings` 里写 `"ResetState"`，
       then 配置能被解析、按键能触发软复位。
       Failure behavior: 配置报未知 action，或按下没反应。
@@ -47,7 +57,7 @@
 - [x] 现有 `alacritty_terminal` 全部 lib 测试通过。
       Evidence: `cargo test -p alacritty_terminal --lib` → 135 passed, 0 failed `[measured]`。
 - [x] 现有 `alacritty` 测试全部通过。
-      Evidence: `cargo test -p alacritty` → 91 passed, 0 failed `[measured]`。
+      Evidence: `cargo test -p alacritty` → 106 passed, 0 failed `[measured]`。
 
 ## Tasks
 
@@ -57,7 +67,7 @@
    Status: DONE `[measured]` — 探针输出 `after tmux setup: click=false drag=true`，
    证明旧逻辑下 `1002h` 清掉了 `1000h`；正式测试在旧逻辑上失败、新逻辑上通过。
 
-2. `alacritty_terminal`：鼠标上报模式改为累积式；新增 `Term::soft_reset()`。
+2. `alacritty_terminal`：保留 xterm 的单值鼠标模式语义；新增 `Term::soft_reset()`。
    Done = 新测试通过 + 该 crate 全量测试通过。
    Could fail at: `mouse_report` 的判断依赖 `MOUSE_MODE` 掩码，改动后上报行为变化；
    与 `swap_alt` 里的键盘模式栈交换互相影响。
@@ -74,6 +84,8 @@
    （osascript 调 System Events 超时、无 GUI 自动化权限），故该步只能由人工完成。
 
 4. `ResetState` 按键动作 + 文档（manpage / features.md / CHANGELOG）。
+   已完成：`extra/man/alacritty.5.scd` 与 `extra/man/alacritty-bindings.5.scd`
+   均已收录，`scdoc` 编译通过 `[measured]`。
    Done = 配置能解析并触发。
    Could fail at: `Action` 枚举加了变体后有 `match` 没覆盖。
    Status: DONE `[measured]` — 见上方验收清单。

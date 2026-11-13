@@ -102,6 +102,19 @@ action = "ResetState"
 
 Unlike `echo -ne '\ec'` (RIS), nothing that was printed before is lost.
 
+## Keys with modifiers inside a multiplexer
+
+Terminals only use the Kitty keyboard protocol once an application asks for it, but `tmux`
+does not forward that request to the terminal it runs in. Keys whose modifiers the legacy
+encoding cannot express, like <kbd>Shift</kbd>+<kbd>Enter</kbd> or
+<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd>, are therefore encoded explicitly by default,
+so they stay distinguishable inside `tmux` without any negotiated protocol.
+
+Programs which understand neither `CSI 27 ; <mods> ; <code> ~` nor `CSI <codepoint> ;
+<mods> u` will show those characters instead of the key. Set
+`extended_key_encoding = false` in the `[terminal]` section to go back to the plain legacy
+encoding.
+
 ## Multi-Window
 
 Alacritty supports running multiple terminal emulators from the same Alacritty

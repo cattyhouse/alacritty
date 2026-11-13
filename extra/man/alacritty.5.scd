@@ -625,6 +625,21 @@ Windows: _"powershell"_
 
 	Default: _"OnlyCopy"_
 
+*extended_key_encoding* = _true_ | _false_
+
+	Report the modifiers of keys which the legacy encoding cannot represent, such as
+	_Shift+Enter_ or _Ctrl+Shift+letter_. This is only relevant when no keyboard
+	protocol was negotiated with the application, which is the case behind a
+	multiplexer like _tmux_, since it does not forward the application's request
+	to the terminal.
+
+	These keys are sent as _CSI 27 ; <mods> ; <code> ~_ and _CSI <codepoint> ;
+	<mods> u_. Programs which understand neither sequence will show their
+	characters instead of acting on the key, so disable this when that matters more
+	than the modifiers.
+
+	Default: _true_
+
 # MOUSE
 
 This section documents the *[mouse]* table of the configuration file.
@@ -829,6 +844,12 @@ _https://docs.rs/winit/latest/winit/keyboard/enum.Key.html#variant.Dead_
 			Scroll all the way to the bottom.
 		*ClearHistory*
 			Clear the display buffer(s) to remove history.
+		*ResetState*
+			Reset the terminal modes and leave the alternate screen, without
+			clearing the display buffer or the scrollback. This is the recovery
+			path for programs which exited without restoring the terminal state,
+			like an SSH session which dropped while a fullscreen program had
+			mouse reporting enabled.
 		*Hide*
 			Hide the Alacritty window.
 		*Minimize*

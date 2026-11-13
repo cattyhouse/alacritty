@@ -196,18 +196,15 @@ IME 停用期间也持续推送位置（`display/mod.rs`，12 行）。这样 IM
 
 ### 症状
 
-1. 应用同时开启 1000 + 1002 + 1003 三种鼠标上报模式时，后一个模式会把前一个清掉 —— tmux 的 `set -g mouse on` 正是这么设的，于是点击上报丢失。
-2. 程序异常退出（典型如 ssh 断线）没恢复终端状态：点击变成转义序列而不是选文字、滚轮滚应用而不是回滚历史、停在备用屏出不来。
+1. 程序异常退出（典型如 ssh 断线）没恢复终端状态：点击变成转义序列而不是选文字、滚轮滚应用而不是回滚历史、停在备用屏出不来。
 
 ### 原因
 
-- 鼠标追踪模式在协议上是**累积**的（1002 扩展 1000，1003 扩展 1002），上游实现却是「最后一个覆盖前面」。
 - 终端模式残留**没法自动检测**：`alacritty_terminal` 只在 **pty 的直接子进程**（登录 shell 本身）退出时才会收到 `ChildEvent::Exited`。`ssh` 是 shell 的子进程，它死掉时 alacritty 收不到任何事件 —— 屏幕不重绘、鼠标位置不变、也没有退出通知。任何基于猜测的自动复位都会误伤 `vim` / `less` / `git` 这类会切换前台进程组的正常程序。
 
 ### 做法
 
-1. `alacritty_terminal`：鼠标上报模式改为累积式；`1002l` 只清自己那一位，不再连带清掉 1003。
-2. 新增 `Term::soft_reset()` 与 `ResetState` 按键动作：重置所有终端模式、退出备用屏，但**不清显示缓冲、不清回滚历史** —— 与 `ESC c` 不同，后者会把屏幕擦掉。
+1. 新增 `Term::soft_reset()` 与 `ResetState` 按键动作：重置所有终端模式、退出备用屏，但**不清显示缓冲、不清回滚历史** —— 与 `ESC c` 不同，后者会把屏幕擦掉。
 
 ### 用法
 
@@ -224,8 +221,10 @@ action = "ResetState"
 
 | 回归测试 | 覆盖的行为 |
 |---|---|
-| `mouse_tracking_modes_are_cumulative` | 三个模式同时保持；旧逻辑下失败于 `term.mode.contains(TermMode::MOUSE_REPORT_CLICK)` |
 | `soft_reset_restores_modes_and_keeps_history` | 模式复位、退出备用屏，且 `history_size` 不变、可见内容仍含原文本 |
+| `soft_reset_restores_the_writing_state` | 字符集、光标模板颜色、窗口标题都被复位，重置后打的字不会再变成画线符号 |
+| `soft_reset_returns_to_the_live_screen` | 重置后回到活动屏，不会停在回滚历史里 |
+| `mouse_tracking_mode_is_mutually_exclusive` | 鼠标上报模式保持 xterm 的单值语义，DECRQM 不会同时报多个模式为「已设置」 |
 | `reset_state_action_is_configurable` | TOML 里写 `"ResetState"` 能被解析、按键能触发 |
 
 ---

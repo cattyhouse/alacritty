@@ -31,6 +31,19 @@
 5. **最终字节可测试**：渲染逻辑抽成 `render_sequence`，兜底决策抽成 `legacy_sequence`，
    单元测试直接断言写到 pty 的字节。
 
+## 配置开关（后续调整）
+
+最初这套兜底是无条件生效的。实测代价：在没有协商协议的普通 shell 里按这些组合键，
+字节会落进命令行（`echo hi` + Ctrl+Shift+F + 回车 → `bash: 6u: command not found`）。
+因此加了 `[terminal] extended_key_encoding`（默认 `true`）：
+
+- `true`：按本文描述兜底，tmux + pi 这类工作流可直接用；
+- `false`：完全回到上游行为，这些键重新按传统编码发送。
+
+决策与闸门共用 `should_build_sequence`，关闭时 `build_sequence` 也不会走兜底分支，
+两者由 `extended_encoding_can_be_disabled` 与
+`disabled_encoding_never_emits_legacy_sequences` 两条测试钉住 `[measured]`。
+
 ## 与 ghostty 的差异（对比结论）
 
 | 键 | 本实现 | ghostty（未协商协议） |

@@ -20,6 +20,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Off-by-one in ViMotion::ParagraphUp
 - Unbounded per-cell memory usage for zero-width cells
 - Unsoundness in `Row::new` when `columns == 0`
+- Custom character sets and cursor template colours surviving a state reset, which made
+    text written afterwards render as line-drawing glyphs in the old colour
+- Window title surviving a state reset
+- `XTMODKEYS` requests switching on kitty keyboard disambiguation, which is no longer
+    honored since a multiplexer never forwards the request to the terminal
 
 ## 0.26.0
 

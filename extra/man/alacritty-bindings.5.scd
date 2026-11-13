@@ -462,6 +462,10 @@ configuration. See *alacritty*(5) for full configuration format documentation.
 :  _"Command"_
 :  _"~Vi|~Search"_
 :  _"ClearHistory"_
+|  _"K"_
+:  _"Command"_
+:  _"~Vi|~Search"_
+:  _"ResetState"_
 |  _"0"_
 :  _"Command"_
 :[
