@@ -977,6 +977,35 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         self.ctx.window().set_mouse_cursor(mouse_state);
     }
 
+    /// Clear locally tracked mouse buttons which lost their release event.
+    ///
+    /// When another application takes the focus mid-click the release is delivered to that
+    /// application instead, so both our own state and the application which asked for mouse
+    /// reporting would keep believing the button is still held. The release is reported to
+    /// the application as well, otherwise its next click is treated as a drag.
+    pub fn release_stuck_mouse_buttons(&mut self) {
+        let mouse_mode = self.ctx.mouse_mode();
+        let pressed = [
+            (self.ctx.mouse().left_button_state, 0),
+            (self.ctx.mouse().middle_button_state, 1),
+            (self.ctx.mouse().right_button_state, 2),
+        ];
+
+        if mouse_mode {
+            for (state, code) in pressed {
+                if state == ElementState::Pressed {
+                    self.mouse_report(code, ElementState::Released);
+                }
+            }
+        }
+
+        let mouse = self.ctx.mouse_mut();
+        mouse.left_button_state = ElementState::Released;
+        mouse.middle_button_state = ElementState::Released;
+        mouse.right_button_state = ElementState::Released;
+        mouse.block_hint_launcher = false;
+    }
+
     /// Force the mouse cursor to be resolved again, even when it is unchanged.
     ///
     /// Used when the window regains focus, since the windowing system keeps the

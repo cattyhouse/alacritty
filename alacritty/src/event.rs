@@ -1988,11 +1988,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         // Mouse releases are swallowed when another application steals
                         // the focus mid-click, so the buttons would stay pressed.
                         if !is_focused {
-                            let mouse = &mut self.ctx.mouse;
-                            mouse.left_button_state = ElementState::Released;
-                            mouse.middle_button_state = ElementState::Released;
-                            mouse.right_button_state = ElementState::Released;
-                            mouse.block_hint_launcher = false;
+                            self.release_stuck_mouse_buttons();
                         }
 
                         // When the unfocused hollow is used we must redraw on focus change.
