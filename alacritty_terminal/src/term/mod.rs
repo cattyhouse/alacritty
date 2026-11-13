@@ -354,6 +354,10 @@ pub struct Config {
     /// Whether to enable kitty keyboard protocol.
     pub kitty_keyboard: bool,
 
+    /// Report modifiers which the legacy encoding would drop, even when no keyboard
+    /// protocol was negotiated.
+    pub extended_key_encoding: bool,
+
     /// OSC52 support mode.
     pub osc52: Osc52,
 }
@@ -366,6 +370,7 @@ impl Default for Config {
             default_cursor_style: Default::default(),
             vi_mode_cursor_style: Default::default(),
             kitty_keyboard: Default::default(),
+            extended_key_encoding: true,
             osc52: Default::default(),
         }
     }
@@ -1036,15 +1041,11 @@ impl<T> Term<T> {
     fn set_keyboard_mode(&mut self, mode: TermMode, apply: KeyboardModesApplyBehavior) {
         let active_mode = self.mode & TermMode::KITTY_KEYBOARD_PROTOCOL;
         self.mode &= !TermMode::KITTY_KEYBOARD_PROTOCOL;
-        let mut new_mode = match apply {
+        let new_mode = match apply {
             KeyboardModesApplyBehavior::Replace => mode,
             KeyboardModesApplyBehavior::Union => active_mode.union(mode),
             KeyboardModesApplyBehavior::Difference => active_mode.difference(mode),
         };
-        // Preserve an outer XTMODKEYS request across Kitty stack operations.
-        if self.modify_other_keys {
-            new_mode.insert(TermMode::DISAMBIGUATE_ESC_CODES);
-        }
         trace!("Setting keyboard mode to {new_mode:?}");
         self.mode |= new_mode;
     }
@@ -1078,6 +1079,20 @@ impl<T: EventListener> Term<T> {
         self.keyboard_mode_stack = Default::default();
         self.inactive_keyboard_mode_stack = Default::default();
         self.modify_other_keys = false;
+
+        // The charset designations and the cursor template live on the grid cursor, so they
+        // survive a reset which only touches the `Term` fields above. Without this, text
+        // written afterwards keeps the dead program's character set (line drawing) and
+        // colours.
+        self.grid.cursor.charsets = Default::default();
+        self.grid.cursor.template = Cell::default();
+
+        // Return to the live screen, otherwise the prompt lands below the viewport and the
+        // user keeps looking at the old scrollback.
+        self.grid.scroll_display(Scroll::Bottom);
+
+        self.title_stack = Vec::new();
+        self.title = None;
 
         self.event_proxy.send_event(Event::MouseCursorDirty);
         self.event_proxy.send_event(Event::CursorBlinkingChange);
@@ -1374,42 +1389,25 @@ impl<T: EventListener> Handler for Term<T> {
         self.set_keyboard_mode(mode.into(), apply);
     }
 
+    /// Track XTerm's `modifyOtherKeys` state so it can be reported back.
+    ///
+    /// Only the state is remembered: the encoding itself is handled by the kitty
+    /// disambiguation branch when a protocol is negotiated, and by the legacy encoder
+    /// otherwise. Overloading this request to switch on kitty disambiguation was tried and
+    /// dropped, since tmux never forwards it to the outer terminal unless the terminfo entry
+    /// advertises `Eneks`.
     #[inline]
     fn set_modify_other_keys(&mut self, mode: ModifyOtherKeys) {
-        if !self.config.kitty_keyboard {
-            return;
-        }
-
-        // Both Enable modes are honored as full disambiguation: tmux uses EnableAll,
-        // and the Kitty encoder is what keeps Ctrl+Shift distinguishable through
-        // tmux's CSI-u forwarding. Mode 1 (except well-defined) is treated the same
-        // to keep the fork minimal.
         self.modify_other_keys = mode != ModifyOtherKeys::Reset;
-        if self.modify_other_keys {
-            self.mode.insert(TermMode::DISAMBIGUATE_ESC_CODES);
-        } else {
-            // Don't clobber a Kitty push that also wants disambiguation.
-            let stack_wants: TermMode = self
-                .keyboard_mode_stack
-                .last()
-                .copied()
-                .unwrap_or(KeyboardModes::NO_MODE)
-                .into();
-            if !stack_wants.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
-                self.mode.remove(TermMode::DISAMBIGUATE_ESC_CODES);
-            }
-        }
     }
 
     #[inline]
     fn report_modify_other_keys(&mut self) {
-        if !self.config.kitty_keyboard {
-            return;
-        }
-
-        let mode = if self.modify_other_keys { 2 } else { 0 };
-        let text = format!("\x1b[>4;{mode}m");
-        self.event_proxy.send_event(Event::PtyWrite(text));
+        let mode = match self.modify_other_keys {
+            true => 2,
+            false => 0,
+        };
+        self.event_proxy.send_event(Event::PtyWrite(format!("\x1b[>4;{mode}m")));
     }
 
     #[inline]
@@ -2035,17 +2033,19 @@ impl<T: EventListener> Handler for Term<T> {
             },
             NamedPrivateMode::ShowCursor => self.mode.insert(TermMode::SHOW_CURSOR),
             NamedPrivateMode::CursorKeys => self.mode.insert(TermMode::APP_CURSOR),
-            // Mouse tracking modes are cumulative: 1002 extends 1000, and 1003
-            // extends 1002, so each one only ever adds its own reporting mode.
+            // Mouse protocols are mutually exclusive.
             NamedPrivateMode::ReportMouseClicks => {
+                self.mode.remove(TermMode::MOUSE_MODE);
                 self.mode.insert(TermMode::MOUSE_REPORT_CLICK);
                 self.event_proxy.send_event(Event::MouseCursorDirty);
             },
             NamedPrivateMode::ReportCellMouseMotion => {
+                self.mode.remove(TermMode::MOUSE_MODE);
                 self.mode.insert(TermMode::MOUSE_DRAG);
                 self.event_proxy.send_event(Event::MouseCursorDirty);
             },
             NamedPrivateMode::ReportAllMouseMotion => {
+                self.mode.remove(TermMode::MOUSE_MODE);
                 self.mode.insert(TermMode::MOUSE_MOTION);
                 self.event_proxy.send_event(Event::MouseCursorDirty);
             },
@@ -2600,6 +2600,26 @@ mod tests {
     use crate::term::cell::{Cell, Flags};
     use crate::term::test::TermSize;
     use crate::vte::ansi::{self, CharsetIndex, Handler, StandardCharset};
+
+    /// Listener which records what the terminal writes back to the pty.
+    #[derive(Clone, Default)]
+    struct RecordingListener {
+        written: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl RecordingListener {
+        fn take(&self) -> Vec<String> {
+            std::mem::take(&mut self.written.lock().unwrap())
+        }
+    }
+
+    impl EventListener for RecordingListener {
+        fn send_event(&self, event: Event) {
+            if let Event::PtyWrite(text) = event {
+                self.written.lock().unwrap().push(text);
+            }
+        }
+    }
 
     #[test]
     fn scroll_display_page_up() {
@@ -3375,64 +3395,76 @@ mod tests {
     }
 
     #[test]
-    fn xtmodkeys_shim_enables_disambiguate() {
+    fn xtmodkeys_is_tracked_and_reported() {
         let size = TermSize::new(5, 10);
-        let mut config = Config::default();
-        config.kitty_keyboard = true;
-        let mut term = Term::new(config, &size, VoidListener);
+        let config = Config { kitty_keyboard: true, ..Default::default() };
+        let mut term = Term::new(config, &size, RecordingListener::default());
 
-        assert!(!term.mode.contains(TermMode::DISAMBIGUATE_ESC_CODES));
-
-        // tmux requests XTMODKEYS EnableAll (`CSI > 4;2 m`); Alacritty must leave
-        // legacy mode so Ctrl+Shift+letter stays distinguishable.
+        // XTMODKEYS is a distinct request from the kitty protocol: honoring it used to
+        // switch on kitty disambiguation, which mangled plain shells because tmux never
+        // forwards the request to the outer terminal in the first place.
         term.set_modify_other_keys(ansi::ModifyOtherKeys::EnableAll);
-        assert!(term.mode.contains(TermMode::DISAMBIGUATE_ESC_CODES));
-
-        // A Kitty push without DISAMBIGUATE must not clear the XTMODKEYS request...
-        term.push_keyboard_mode(ansi::KeyboardModes::REPORT_EVENT_TYPES);
-        assert!(term.mode.contains(TermMode::DISAMBIGUATE_ESC_CODES));
-        term.pop_keyboard_modes(1);
-        assert!(term.mode.contains(TermMode::DISAMBIGUATE_ESC_CODES));
-
-        // ...and reset must return to legacy.
-        term.set_modify_other_keys(ansi::ModifyOtherKeys::Reset);
         assert!(!term.mode.contains(TermMode::DISAMBIGUATE_ESC_CODES));
+
+        // It must not interfere with a kitty push either.
+        term.push_keyboard_mode(ansi::KeyboardModes::DISAMBIGUATE_ESC_CODES);
+        assert!(term.mode.contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        term.set_modify_other_keys(ansi::ModifyOtherKeys::Reset);
+        assert!(term.mode.contains(TermMode::DISAMBIGUATE_ESC_CODES));
     }
 
     #[test]
-    fn mouse_tracking_modes_are_cumulative() {
+    fn xtmodkeys_reports_the_actual_state() {
+        let size = TermSize::new(5, 10);
+        let mut term = Term::new(Config::default(), &size, RecordingListener::default());
+        let listener = term.event_proxy.clone();
+
+        term.report_modify_other_keys();
+        assert_eq!(listener.take(), vec![String::from("\x1b[>4;0m")]);
+
+        term.set_modify_other_keys(ansi::ModifyOtherKeys::EnableAll);
+        term.report_modify_other_keys();
+        assert_eq!(listener.take(), vec![String::from("\x1b[>4;2m")]);
+
+        // Resetting goes back to reporting the disabled state.
+        term.set_modify_other_keys(ansi::ModifyOtherKeys::Reset);
+        term.report_modify_other_keys();
+        assert_eq!(listener.take(), vec![String::from("\x1b[>4;0m")]);
+    }
+
+    #[test]
+    fn mouse_tracking_mode_is_mutually_exclusive() {
         let size = TermSize::new(10, 5);
         let mut term = Term::new(Config::default(), &size, VoidListener);
         let mut parser = ansi::Processor::<ansi::StdSyncHandler>::new();
 
-        // What `tmux` with `set -g mouse on` emits.
-        parser.advance(&mut term, b"\x1b[?1000h\x1b[?1002h\x1b[?1006h");
-        assert!(term.mode.contains(TermMode::MOUSE_REPORT_CLICK));
-        assert!(term.mode.contains(TermMode::MOUSE_DRAG));
-        assert!(term.mode.contains(TermMode::SGR_MOUSE));
+        // Setting a tracking mode replaces the previous one. xterm keeps a single
+        // `send_mouse_pos` value and its DECRQM replies are
+        // `MdBool(send_mouse_pos == <mode>)`, so exactly one tracking mode is ever
+        // reported as set.
+        parser.advance(&mut term, b"\x1b[?1000h");
+        assert_eq!(term.mode & TermMode::MOUSE_MODE, TermMode::MOUSE_REPORT_CLICK);
 
-        // 1003 extends 1002, so it must not drop the narrower modes.
+        parser.advance(&mut term, b"\x1b[?1002h");
+        assert_eq!(term.mode & TermMode::MOUSE_MODE, TermMode::MOUSE_DRAG);
+
         parser.advance(&mut term, b"\x1b[?1003h");
-        assert!(term.mode.contains(TermMode::MOUSE_REPORT_CLICK));
-        assert!(term.mode.contains(TermMode::MOUSE_DRAG));
-        assert!(term.mode.contains(TermMode::MOUSE_MOTION));
+        assert_eq!(term.mode & TermMode::MOUSE_MODE, TermMode::MOUSE_MOTION);
 
-        // Each mode is unset on its own, without touching the others.
+        // Resetting one mode only clears its own bit, so the mode which is actually
+        // active survives a program tearing down a mode it had already replaced.
         parser.advance(&mut term, b"\x1b[?1002l");
-        assert!(term.mode.contains(TermMode::MOUSE_REPORT_CLICK));
-        assert!(!term.mode.contains(TermMode::MOUSE_DRAG));
-        assert!(term.mode.contains(TermMode::MOUSE_MOTION));
+        assert_eq!(term.mode & TermMode::MOUSE_MODE, TermMode::MOUSE_MOTION);
 
         parser.advance(&mut term, b"\x1b[?1003l");
-        assert!(term.mode.contains(TermMode::MOUSE_REPORT_CLICK));
-        assert!(!term.mode.contains(TermMode::MOUSE_MOTION));
-
-        parser.advance(&mut term, b"\x1b[?1000l");
         assert!(!term.mode.intersects(TermMode::MOUSE_MODE));
 
         // The mouse encoding is independent of the tracking modes.
+        parser.advance(&mut term, b"\x1b[?1000h\x1b[?1006h");
+        assert!(term.mode.contains(TermMode::MOUSE_REPORT_CLICK));
         assert!(term.mode.contains(TermMode::SGR_MOUSE));
         parser.advance(&mut term, b"\x1b[?1006l");
+        assert!(term.mode.contains(TermMode::MOUSE_REPORT_CLICK));
         assert!(!term.mode.contains(TermMode::SGR_MOUSE));
     }
 
@@ -3467,6 +3499,51 @@ mod tests {
         let visible = term.grid().display_iter().map(|c| c.c).collect::<String>();
         assert!(visible.contains("line one"), "visible content was wiped: {visible:?}");
         assert!(visible.contains("line two"), "visible content was wiped: {visible:?}");
+    }
+
+    #[test]
+    fn soft_reset_restores_the_writing_state() {
+        let size = TermSize::new(5, 20);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser = ansi::Processor::<ansi::StdSyncHandler>::new();
+
+        // A fullscreen program leaves behind a graphic charset on G0, a red cursor
+        // template and its own window title.
+        parser.advance(&mut term, b"\x1b]2;vim: notes.txt\x07\x1b(0\x1b[31m");
+        parser.advance(&mut term, b"\r\n");
+        term.soft_reset();
+
+        // Text written after the reset must be plain ASCII in the default colour, not a
+        // line-drawing glyph in a leftover colour.
+        let point = term.grid().cursor.point;
+        parser.advance(&mut term, b"q");
+        let cell = &term.grid()[point];
+        assert_eq!(cell.c, 'q', "graphic charset survived the reset");
+        assert_eq!(cell.fg, Color::Named(NamedColor::Foreground), "colour survived the reset");
+
+        // The title the dead program set is gone, like it is on `ESC c`.
+        assert_eq!(term.title, None, "title survived the reset");
+    }
+
+    #[test]
+    fn soft_reset_returns_to_the_live_screen() {
+        let size = TermSize::new(5, 20);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser = ansi::Processor::<ansi::StdSyncHandler>::new();
+
+        for line in 0..20 {
+            parser.advance(&mut term, format!("line {line}\r\n").as_bytes());
+        }
+
+        // Scroll back into the history, then recover.
+        term.scroll_display(Scroll::PageUp);
+        assert_ne!(term.grid().display_offset(), 0);
+
+        term.soft_reset();
+
+        // Without this the prompt which follows the reset is written below the viewport
+        // and the user sees the old history instead.
+        assert_eq!(term.grid().display_offset(), 0, "still viewing the scrollback");
     }
 
     #[test]

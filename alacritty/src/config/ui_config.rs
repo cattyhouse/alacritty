@@ -124,6 +124,7 @@ impl UiConfig {
             default_cursor_style: self.cursor.style(),
             osc52: self.terminal.osc52.0,
             kitty_keyboard: true,
+            extended_key_encoding: true,
         }
     }
 
