@@ -124,7 +124,7 @@ impl UiConfig {
             default_cursor_style: self.cursor.style(),
             osc52: self.terminal.osc52.0,
             kitty_keyboard: true,
-            extended_key_encoding: true,
+            extended_key_encoding: self.terminal.extended_key_encoding.0,
         }
     }
 
@@ -695,6 +695,16 @@ impl serde::de::Visitor<'_> for StringVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extended_key_encoding_reaches_term_config() {
+        let config: UiConfig =
+            toml::from_str("[terminal]\nextended_key_encoding = false\n").unwrap();
+        assert!(!config.term_options().extended_key_encoding);
+
+        let config: UiConfig = toml::from_str("").unwrap();
+        assert!(config.term_options().extended_key_encoding);
+    }
 
     use alacritty_terminal::term::test::mock_term;
 

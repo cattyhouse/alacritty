@@ -77,12 +77,13 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         // Mask `Alt` modifier from input when we won't send esc.
         let mods = if self.alt_send_esc(&key, text) { mods } else { mods & !ModifiersState::ALT };
 
+        let extended = self.ctx.config().terminal.extended_key_encoding.0;
         let build_key_sequence =
-            should_build_sequence(&key.logical_key, key.location, text, mode, mods);
+            should_build_sequence(&key.logical_key, key.location, text, mode, mods, extended);
         let is_modifier_key = Self::is_modifier_key(&key);
 
         let bytes = if build_key_sequence {
-            build_sequence(key, mods, mode)
+            build_sequence(key, mods, mode, extended)
         } else {
             let mut bytes = Vec::with_capacity(text.len() + 1);
             if mods.alt_key() {
@@ -240,7 +241,10 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             {
                 return;
             },
-            _ => build_sequence(key, mods, mode),
+            _ => {
+                let extended = self.ctx.config().terminal.extended_key_encoding.0;
+                build_sequence(key, mods, mode, extended)
+            },
         };
 
         self.ctx.write_to_pty(bytes);
@@ -380,6 +384,7 @@ fn should_build_sequence(
     text: &str,
     mode: TermMode,
     mods: ModifiersState,
+    extended: bool,
 ) -> bool {
     if mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC) {
         return true;
@@ -404,7 +409,7 @@ fn should_build_sequence(
         //
         // The unshifted key only refines the codepoint of character keys, never
         // whether a sequence is built, so it is not needed for this decision.
-        _ if legacy_sequence(logical, None, mods.into()).is_some() => true,
+        _ if extended && legacy_sequence(logical, None, mods.into()).is_some() => true,
         // Exclude all the named keys unless they have textual representation.
         Key::Named(named) => named.to_text().is_none(),
         _ => text.is_empty(),
@@ -415,7 +420,7 @@ fn should_build_sequence(
 ///
 /// The key sequences for `APP_KEYPAD` and alike are handled inside the bindings.
 #[inline(never)]
-fn build_sequence(key: KeyEvent, mods: ModifiersState, mode: TermMode) -> Vec<u8> {
+fn build_sequence(key: KeyEvent, mods: ModifiersState, mode: TermMode, extended: bool) -> Vec<u8> {
     let mut modifiers = mods.into();
 
     let kitty_seq = mode.intersects(
@@ -443,7 +448,7 @@ fn build_sequence(key: KeyEvent, mods: ModifiersState, mode: TermMode) -> Vec<u8
     // modifiers of some keys (e.g. Shift+Enter arrives as plain `\r`), so emit an
     // explicit sequence for exactly those keys.
     let unmodded = key.key_without_modifiers();
-    let legacy_base = if kitty_seq || kitty_encode_all {
+    let legacy_base = if kitty_seq || kitty_encode_all || !extended {
         None
     } else {
         legacy_sequence(&key.logical_key, Some(&unmodded), modifiers)
@@ -1059,6 +1064,7 @@ mod tests {
                     text,
                     TermMode::empty(),
                     mods,
+                    true,
                 );
                 let encoder = legacy_sequence(key, None, mods.into()).is_some();
                 assert_eq!(gate, encoder, "{key:?} with {mods:?}");
@@ -1078,6 +1084,7 @@ mod tests {
             "\r",
             mode,
             ModifiersState::SHIFT,
+            true,
         ));
         assert!(should_build_sequence(
             &named(NamedKey::Tab),
@@ -1085,6 +1092,7 @@ mod tests {
             "\t",
             mode,
             ModifiersState::SHIFT,
+            true,
         ));
         assert!(!should_build_sequence(
             &character("F"),
@@ -1092,6 +1100,7 @@ mod tests {
             "F",
             mode,
             ModifiersState::SHIFT,
+            true,
         ));
         assert!(!should_build_sequence(
             &named(NamedKey::Enter),
@@ -1099,6 +1108,7 @@ mod tests {
             "\r",
             mode,
             ModifiersState::empty(),
+            true,
         ));
     }
 
@@ -1111,6 +1121,7 @@ mod tests {
             "\x06",
             TermMode::empty(),
             mods,
+            true,
         ));
         assert!(should_build_sequence(
             &named(NamedKey::Enter),
@@ -1118,6 +1129,7 @@ mod tests {
             "\r",
             TermMode::empty(),
             ModifiersState::SHIFT,
+            true,
         ));
     }
 
@@ -1130,7 +1142,73 @@ mod tests {
             "F",
             TermMode::empty(),
             ModifiersState::SHIFT,
+            true,
         ));
+    }
+
+    #[test]
+    fn extended_encoding_can_be_disabled() {
+        // With the knob off, the gate falls back to the upstream decision: no protocol,
+        // no sequence, so plain shells never see an escape sequence they cannot parse.
+        let mods = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(should_build_sequence(
+            &character("F"),
+            KeyLocation::Standard,
+            "\x06",
+            TermMode::empty(),
+            mods,
+            true,
+        ));
+        assert!(!should_build_sequence(
+            &character("F"),
+            KeyLocation::Standard,
+            "\x06",
+            TermMode::empty(),
+            mods,
+            false,
+        ));
+        assert!(!should_build_sequence(
+            &named(NamedKey::Enter),
+            KeyLocation::Standard,
+            "\r",
+            TermMode::empty(),
+            ModifiersState::SHIFT,
+            false,
+        ));
+
+        // A negotiated protocol is independent of the knob.
+        assert!(should_build_sequence(
+            &named(NamedKey::Enter),
+            KeyLocation::Standard,
+            "\r",
+            TermMode::DISAMBIGUATE_ESC_CODES,
+            ModifiersState::SHIFT,
+            false,
+        ));
+    }
+
+    #[test]
+    fn disabled_encoding_never_emits_legacy_sequences() {
+        // The encoder must agree with the gate, otherwise keys get dropped. This asserts the
+        // shared decision function the encoder uses, which is what `build_sequence` consults.
+        let key = named(NamedKey::Enter);
+        let mods = ModifiersState::SHIFT;
+
+        // With the knob on, the key produces an explicit sequence.
+        let encoded = legacy_sequence(&key, None, mods.into());
+        assert!(encoded.is_some());
+
+        // With the knob off, `build_sequence` never consults it, so the key falls back to the
+        // text path: plain carriage return, exactly like upstream.
+        let gate = should_build_sequence(
+            &key,
+            KeyLocation::Standard,
+            "\r",
+            TermMode::empty(),
+            mods,
+            false,
+        );
+        assert!(!gate, "gate still routes the key into the encoder while disabled");
     }
 
     #[test]
@@ -1142,6 +1220,7 @@ mod tests {
             "\x06",
             TermMode::empty(),
             ModifiersState::CONTROL,
+            true,
         ));
     }
 }
