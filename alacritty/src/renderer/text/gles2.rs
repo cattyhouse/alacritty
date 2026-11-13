@@ -16,7 +16,7 @@ use crate::renderer::{Error, GlExtensions};
 use super::atlas::{ATLAS_SIZE, Atlas};
 use super::{
     Glyph, LoadGlyph, LoaderApi, RenderingGlyphFlags, RenderingPass, TextRenderApi,
-    TextRenderBatch, TextRenderer, TextShader, glsl3,
+    TextRenderBatch, TextRenderer, TextShader, TextureGroupedCells, glsl3,
 };
 
 // Shader source.
@@ -34,6 +34,7 @@ pub struct Gles2Renderer {
     current_atlas: usize,
     active_tex: GLuint,
     dual_source_blending: bool,
+    scratch: TextureGroupedCells,
 }
 
 impl Gles2Renderer {
@@ -154,6 +155,7 @@ impl Gles2Renderer {
             current_atlas: 0,
             active_tex: 0,
             dual_source_blending,
+            scratch: TextureGroupedCells::default(),
         })
     }
 }
@@ -190,6 +192,7 @@ impl<'a> TextRenderer<'a> for Gles2Renderer {
         }
 
         let res = func(RenderApi {
+            scratch: &mut self.scratch,
             active_tex: &mut self.active_tex,
             batch: &mut self.batch,
             atlas: &mut self.atlas,
@@ -338,6 +341,7 @@ impl TextRenderBatch for Batch {
 
 #[derive(Debug)]
 pub struct RenderApi<'a> {
+    scratch: &'a mut TextureGroupedCells,
     active_tex: &'a mut GLuint,
     batch: &'a mut Batch,
     atlas: &'a mut Vec<Atlas>,
@@ -367,6 +371,10 @@ impl LoadGlyph for RenderApi<'_> {
 impl TextRenderApi<Batch> for RenderApi<'_> {
     fn batch(&mut self) -> &mut Batch {
         self.batch
+    }
+
+    fn scratch(&mut self) -> &mut TextureGroupedCells {
+        self.scratch
     }
 
     fn render_batch(&mut self) {
